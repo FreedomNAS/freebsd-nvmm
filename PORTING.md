@@ -326,7 +326,7 @@ riconfermo con i percorsi esatti quando il codice c'è):
 
 ```sh
 # sorgenti del kernel 15.1 (se /usr/src/sys non c'è)
-git clone --depth 1 -b releng/15.1 https://git.FreeBSD.org/src.git /usr/src
+git clone --depth 1 -b releng/15.1 https://github.com/freebsd/freebsd-src.git /usr/src
 cd /percorso/freebsd-nvmm/sys/modules/nvmm
 make SYSDIR=/usr/src/sys
 kldload ./nvmm.ko && dmesg | tail
