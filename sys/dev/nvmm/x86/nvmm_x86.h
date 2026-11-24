@@ -31,6 +31,10 @@
 #ifndef _NVMM_X86_H_
 #define _NVMM_X86_H_
 
+#if defined(__FreeBSD__)
+#include <dev/nvmm/nvmm_bitops.h>
+#endif
+
 /* -------------------------------------------------------------------------- */
 
 #ifndef ASM_NVMM
@@ -218,7 +222,53 @@ struct nvmm_cap_md {
 #ifndef ASM_NVMM
 
 #include <sys/types.h>
+#if defined(__NetBSD__)
 #include <x86/cpu_extended_state.h>
+#else
+/*
+ * FreeBSD has no <x86/cpu_extended_state.h>. These are the same layouts
+ * and field names as NetBSD's struct fxsave (as DragonFly does it), so the
+ * ABI seen by userland stays the NetBSD one.
+ */
+union nvmm_x64_state_fpu_addr {
+	uint64_t fa_64;
+	struct {
+		uint32_t fa_off;
+		uint16_t fa_seg;
+		uint16_t fa_opcode;
+	} fa_32;
+};
+_Static_assert(sizeof(union nvmm_x64_state_fpu_addr) == 8, "fpu addr");
+
+struct nvmm_x64_state_fpu_mmreg {
+	uint64_t mm_significand;
+	uint16_t mm_exp_sign;
+	uint8_t  mm_rsvd[6];
+};
+_Static_assert(sizeof(struct nvmm_x64_state_fpu_mmreg) == 16, "fpu mmreg");
+
+struct nvmm_x64_state_fpu_xmmreg {
+	uint8_t xmm_bytes[16];
+};
+_Static_assert(sizeof(struct nvmm_x64_state_fpu_xmmreg) == 16, "fpu xmmreg");
+
+/* FPU state (x87 + SSE), FXSAVE layout. */
+struct nvmm_x64_state_fpu {
+	uint16_t fx_cw;		/* Control Word */
+	uint16_t fx_sw;		/* Status Word */
+	uint8_t fx_tw;		/* Tag Word (abridged) */
+	uint8_t fx_zero;
+	uint16_t fx_opcode;
+	union nvmm_x64_state_fpu_addr fx_ip;	/* Instruction Pointer */
+	union nvmm_x64_state_fpu_addr fx_dp;	/* Data Pointer */
+	uint32_t fx_mxcsr;
+	uint32_t fx_mxcsr_mask;
+	struct nvmm_x64_state_fpu_mmreg fx_87_ac[8];	/* x87 registers */
+	struct nvmm_x64_state_fpu_xmmreg fx_xmm[16];	/* XMM registers */
+	uint8_t fx_rsvd[96];
+} __aligned(16);
+_Static_assert(sizeof(struct nvmm_x64_state_fpu) == 512, "fpu");
+#endif
 
 struct nvmm_x64_state_seg {
 	uint16_t selector;
@@ -265,7 +315,11 @@ struct nvmm_x64_state {
 	uint64_t drs[NVMM_X64_NDR];
 	uint64_t msrs[NVMM_X64_NMSR];
 	struct nvmm_x64_state_intr intr;
+#if defined(__NetBSD__)
 	struct fxsave fpu;
+#else
+	struct nvmm_x64_state_fpu fpu;
+#endif
 };
 
 #define NVMM_VCPU_CONF_CPUID	NVMM_VCPU_CONF_MD_BEGIN
