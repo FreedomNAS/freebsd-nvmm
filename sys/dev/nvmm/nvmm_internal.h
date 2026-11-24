@@ -31,17 +31,12 @@
 #ifndef _NVMM_INTERNAL_H_
 #define _NVMM_INTERNAL_H_
 
-#include <sys/types.h>
+#ifndef _KERNEL
+#error "This file should not be included by userland programs."
+#endif
 
-#include <sys/lwp.h>
-#include <sys/mutex.h>
-#include <sys/rwlock.h>
-#include <sys/sched.h>
-
+#include <dev/nvmm/nvmm_os.h>
 #include <dev/nvmm/nvmm.h>
-
-struct uvm_object;
-struct vmspace;
 
 #define NVMM_MAX_MACHINES	128
 #define NVMM_MAX_VCPUS		256
@@ -56,7 +51,7 @@ struct nvmm_cpu {
 	/* Shared. */
 	bool present;
 	nvmm_cpuid_t cpuid;
-	kmutex_t lock;
+	os_mtx_t lock;
 
 	/* Comm page. */
 	struct nvmm_comm_page *comm;
@@ -72,7 +67,7 @@ struct nvmm_hmapping {
 	bool present;
 	uintptr_t hva;
 	size_t size;
-	struct uvm_object *uobj;
+	os_vmobj_t *vmobj;
 };
 
 struct nvmm_machine {
@@ -80,13 +75,13 @@ struct nvmm_machine {
 	nvmm_machid_t machid;
 	time_t time;
 	struct nvmm_owner *owner;
-	krwlock_t lock;
+	os_rwl_t lock;
 
 	/* Comm */
-	struct uvm_object *commuobj;
+	os_vmobj_t *commobj;
 
 	/* Kernel */
-	struct vmspace *vm;
+	os_vmspace_t *vm;
 	gpaddr_t gpa_begin;
 	gpaddr_t gpa_end;
 
@@ -144,15 +139,27 @@ extern const struct nvmm_impl nvmm_x86_vmx;
 
 extern volatile bool nvmm_suspending;
 
+/* Frontend entry points used by the OS glue (nvmm_<os>.c). */
+extern const struct nvmm_impl *nvmm_impl;
+extern struct nvmm_owner nvmm_root_owner;
+extern volatile unsigned int nmachines;
+
+const struct nvmm_impl *nvmm_ident(void);
+int nvmm_init(void);
+void nvmm_fini(void);
+int nvmm_ioctl(struct nvmm_owner *, unsigned long, void *);
+void nvmm_kill_machines(struct nvmm_owner *);
+void nvmm_close(struct nvmm_owner *);
+int nvmm_comm_object(struct nvmm_owner *, uint64_t, size_t, int,
+    os_vmobj_t **, uint64_t *);
+void nvmm_suspend(void);
+void nvmm_resume(void);
+
 static inline bool
 nvmm_return_needed(struct nvmm_cpu *vcpu, struct nvmm_vcpu_exit *exit)
 {
 
-	if (__predict_false(preempt_needed())) {
-		exit->reason = NVMM_VCPU_EXIT_NONE;
-		return true;
-	}
-	if (__predict_false(curlwp->l_flag & LW_USERRET)) {
+	if (__predict_false(os_return_needed())) {
 		exit->reason = NVMM_VCPU_EXIT_NONE;
 		return true;
 	}
@@ -160,7 +167,7 @@ nvmm_return_needed(struct nvmm_cpu *vcpu, struct nvmm_vcpu_exit *exit)
 		exit->reason = NVMM_VCPU_EXIT_STOPPED;
 		return true;
 	}
-	if (__predict_false(atomic_load_relaxed(&nvmm_suspending))) {
+	if (__predict_false(os_atomic_load_bool(&nvmm_suspending))) {
 		exit->reason = NVMM_VCPU_EXIT_NONE;
 		return true;
 	}
