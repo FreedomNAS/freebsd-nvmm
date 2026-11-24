@@ -267,7 +267,7 @@ sulla tua macchina di test, e con un commit per passo logico.
 
 | Fase | Contenuto | Test di accettazione (tuo, su hardware dedicato) |
 |---|---|---|
-| **1. Scheletro** | `sys/modules/nvmm/Makefile`, `sys/dev/nvmm/`: frontend DragonFly importato, ramo `__FreeBSD__` in `nvmm_os.h`, `nvmm_freebsd.c` con device e modulo; `vmx_ident` reale (VMX, EPT, unrestricted guest, INVEPT/INVVPID) senza VMXON; rifiuto se vmm.ko è presente; `/dev/nvmm` con `NVMM_IOC_CAPABILITY` funzionante e `ENOSYS` per il resto | build pulita; `kldload` su i5 → messaggio "attached"; su CPU senza VMX/EPT/UG → rifiuto con messaggio, niente panic; con vmm.ko caricato → rifiuto; un piccolo programma legge la capability; `kldunload` pulito |
+| **1. Scheletro** | `sys/modules/nvmm/Makefile`, `sys/dev/nvmm/`: frontend NetBSD convertito alle `os_*`, ramo `__FreeBSD__` in `nvmm_os.h`, `nvmm_freebsd.c` con device e modulo; `vmx_ident` reale (VMX, EPT, unrestricted guest, INVEPT/INVVPID) senza VMXON; rifiuto se vmm.ko è presente; `/dev/nvmm` con `NVMM_IOC_CAPABILITY` funzionante e `ENOSYS` per il resto | build pulita; `kldload` su i5 → messaggio "attached"; su CPU senza VMX/EPT/UG → rifiuto con messaggio, niente panic; con vmm.ko caricato → rifiuto; un piccolo programma legge la capability; `kldunload` pulito |
 | **2. VMXON per CPU** | `vmx_init/fini`: `IA32_FEATURE_CONTROL`, `CR4.VMXE`, regioni VMXON, `smp_rendezvous`, VMXOFF allo scarico, vettore IPI | load/unload ripetuti 100 volte; `kldload vmm` dopo nvmm rifiutato (secondo **D3**) |
 | **3. Macchina e vCPU** | vmspace EPT, VMCS, VPID, MSR/I/O bitmap, comm page nel processo, ioctl create/destroy/configure/setstate/getstate | creazione e distruzione di 128 macchine; uscita del processo senza distruggere → nessun leak (`vmstat -m`, `sysctl vm.stats`) |
 | **4. Memoria guest** | `hva_map/unmap`, `gpa_map/unmap`, oggetti VM, fault, protocollo `pm_eptgen` | test che mappa, scrive dall'host e rilegge dal pmap guest; unmap mentre un'altra vCPU gira |
@@ -316,6 +316,50 @@ FreeBSD 15.1 e le passa il disco come secondo disco, poi
 - `sshd`, DHCP su qualunque scheda, hostname `nvmm-dev`, utente `admin`
   (gruppo wheel, sudo senza password) e `root` con password
   `freedomnas` e la tua chiave SSH.
+
+## 8. Stato della fase 1 (2026-11-24)
+
+Fatto, compilato pulito (`-Werror`) sul disco di sviluppo (15.1-p7):
+
+- `nvmm.ko`: frontend NetBSD sulle `os_*`, glue FreeBSD (`/dev/nvmm`
+  `root:wheel 0600`, `d_mmap_single` per la comm page), `vmx_ident`
+  completo con letture MSR protette (`rdmsr_safe`) e messaggi per VMX
+  disabilitato nel firmware, EPT, unrestricted guest e VPID mancanti;
+  `NVMM_IOC_CAPABILITY` funzionante, gli altri ioctl rispondono `ENOSYS`;
+- tutti i simboli esterni del modulo esistono nel kernel 15.1-p7;
+- `tools/nvmmcap`: legge la capability e controlla `ENOSYS`.
+
+Provato in una VM FreeBSD usa e getta su CPU AMD (mai sul PC di lavoro):
+rifiuto pulito "this CPU is not supported"; con vmm.ko caricato il linker
+rifiuta nvmm.ko. La prima versione andava in **panic** proprio nel rifiuto:
+FreeBSD manda `MOD_UNLOAD` anche dopo un `MOD_LOAD` fallito, e
+`nvmm_fini()` girava su un modulo mai inizializzato. Corretto.
+
+Correzioni a bug NetBSD trovati nel porting (da segnalare upstream):
+`nvmm_enter_sig()` restituisce 0 dopo un'attesa interrotta (poi
+`nvmm_exit()` sbilancia il contatore), `nvmm_kill_machines()` perde la comm
+object, `gpa_unmap` rifiuta l'ultima pagina (DragonFly l'ha già corretto).
+
+### Test sulla macchina di test (i5)
+
+```sh
+cd ~admin && git clone <questo repo> freebsd-nvmm   # o rsync dal PC
+cd freebsd-nvmm/sys/modules/nvmm && make
+cd ../../../tools/nvmmcap && make
+
+sudo kldload ../../sys/modules/nvmm/nvmm.ko && dmesg | tail -3
+#   atteso: "nvmm: attached, using backend x86-vmx"
+./nvmmcap                     # atteso: version 2 ... "OK"
+sudo kldload vmm              # atteso: rifiutato,
+dmesg | tail -2               #   "interface vmm.1 already present in the KLD 'nvmm.ko'"
+sudo kldunload nvmm           # atteso: pulito
+sudo kldload vmm && sudo kldload ../../sys/modules/nvmm/nvmm.ko
+#   atteso: nvmm rifiutato dal linker; poi: sudo kldunload vmm
+```
+
+Con `boot -v` (o `sysctl debug.bootverbose=1` prima del load) il modulo
+stampa anche se l'EPT ha i bit A/D (Haswell sì, Ivy Bridge no) e la
+maschera XCR0.
 
 Sulla macchina di test:
 
