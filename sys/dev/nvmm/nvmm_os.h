@@ -70,12 +70,12 @@
 #include <sys/pcpu.h>
 #include <vm/vm.h>
 #include <vm/vm_param.h>
+#include <vm/pmap.h>
 #include <vm/vm_extern.h>
 #include <vm/vm_kern.h>
 #include <vm/vm_map.h>
 #include <vm/vm_object.h>
 #include <vm/vm_page.h>
-#include <vm/pmap.h>
 #include <machine/atomic.h>
 #include <machine/cpufunc.h>
 #include <machine/segments.h>
@@ -251,6 +251,8 @@ MALLOC_DECLARE(M_NVMM);
 #define os_atomic_dec_uint(x)	atomic_dec_uint(x)
 #define os_atomic_load_uint(x)	atomic_load_relaxed(x)
 #define os_atomic_inc_64(x)	atomic_inc_64(x)
+#define os_atomic_load_bool(x)	atomic_load_relaxed(x)
+#define os_atomic_store_bool(x, v) atomic_store_relaxed(x, v)
 #elif defined(__DragonFly__)
 #include <machine/atomic.h>
 #define os_atomic_inc_uint(x)	atomic_add_int(x, 1)
