@@ -113,23 +113,30 @@ bit CPUID "con DragonFly"; a novembre 2026 DragonFly ha fatto un giro di
     eventi, `xcr0_valid/cr4_valid/efer_valid` dinamici, CPUID, XSETBV. Vanno
     verificate una per una sulla base scelta.
 
-### Scelta della base: DragonFly
+### Scelta della base: codice NetBSD + strato di astrazione DragonFly
 
-Motivi:
+Con l'ABI NetBSD (decisione **D1**, §6) la base è il codice **NetBSD**:
+è lui che implementa quell'ABI (kernel v2, `comm->stop`,
+`NVMM_VCPU_CONF_XCR0_MASK`, XSAVE esteso, suspend, correzioni 2026). Da
+DragonFly prendiamo il **metodo**, non il frontend:
 
-- ha già lo strato `nvmm_os.h`: il porting è un ramo `__FreeBSD__` più
-  `nvmm_freebsd.c`, non una riscrittura delle chiamate UVM sparse in
-  `nvmm.c`;
-- il VM di FreeBSD e quello di DragonFly hanno lo stesso antenato
-  (`vm_map`, `vm_object`, `vm_page`, `vmspace`): `os_vmobj_*` si traduce
-  quasi riga per riga, mentre UVM di NetBSD ha un modello diverso;
-- la comm page mappata dal kernel evita di scrivere un `d_mmap_single`
-  per-fd (fattibile su FreeBSD, ma una superficie in più);
-- è la linea su cui l'autore lavora attivamente per l'indipendenza dal
-  sistema operativo.
+- `nvmm_os.h` di DragonFly con un ramo `__FreeBSD__` in più (i rami
+  NetBSD e DragonFly restano, così i diff con gli originali sono leggibili);
+- `nvmm.c` di NetBSD con le chiamate UVM/kmem/rwlock dirette sostituite
+  dalle `os_*`, come ha fatto DragonFly; la glue di sistema (autoconf,
+  fileops, pmf) esce da `nvmm.c` e va in `nvmm_freebsd.c`;
+- le strutture FPU autonome di DragonFly (`struct nvmm_x64_state_fpu`) al
+  posto di `struct fxsave` di `<x86/cpu_extended_state.h>`, che FreeBSD
+  non ha: stessi nomi di campo e stesso layout (512 byte), quindi l'ABI
+  verso QEMU resta quella NetBSD;
+- `__BIT`/`__BITS` definiti per FreeBSD dove servono (anche negli header
+  visti da userland).
 
-La questione dell'ABI (v3 DragonFly o v2 NetBSD) è aperta: vedi decisione
-**D1** in fondo.
+La comm page segue l'ABI NetBSD: l'utente fa `mmap()` su `/dev/nvmm`
+all'offset `NVMM_COMM_OFF(machid, cpuid)`. Su FreeBSD questo è
+`d_mmap_single` nella `cdevsw`, che restituisce l'oggetto VM della comm
+page della macchina con l'offset giusto (lo stesso meccanismo del
+`devmem` di bhyve).
 
 ---
 
@@ -274,60 +281,48 @@ correzioni NetBSD↔DragonFly, sysctl/statistiche, pacchetto FreeBSD.
 
 ---
 
-## 6. Scelte aperte (servono le tue decisioni)
+## 6. Decisioni prese (2026-11-24)
 
-### D1. Quale ABI esporre a userland
-
-| Opzione | Pro | Contro |
+| | Decisione | Note |
 |---|---|---|
-| **A. ABI DragonFly** (kernel v3, libnvmm v1) — *consigliata ora* | kernel e libnvmm dallo stesso albero, sempre coerenti; zero divergenze da mantenere; QEMU funziona come su DragonFly oggi | QEMU usa il percorso senza `nvmm_vcpu_stop()` (kick via segnale, meno elegante); manca lo stato XSAVE esteso di NetBSD finché DragonFly non lo porta |
-| **B. ABI NetBSD** (kernel v2, libnvmm v2, `stop`) | è l'ABI che QEMU upstream conosce meglio; `stop` senza race | serve `mmap` della comm page o una ABI mista; il codice di base (DragonFly) va adattato in più punti; ogni aggiornamento da DragonFly diventa un merge |
-| **C. ABI DragonFly + `stop` come estensione** | prende il meglio | un terzo dialetto NVMM che nessun altro usa: da evitare finché non lo accetta upstream |
-
-### D2. Memoria guest: paginabile o cablata
-
-| Opzione | Pro | Contro |
-|---|---|---|
-| **A. Paginabile** (`OBJT_SWAP`, fault su EPT violation) — *consigliata come default* | come bhyve e come NVMM originale; la RAM non usata dal guest non è occupata; overcommit possibile | più percorsi da testare (fault, A/D emulati su Ivy Bridge); un guest può finire in swap |
-| **B. Cablata** (`vm_map_wire` alla `gpa_map`) | prestazioni prevedibili, meno fault | la RAM della VM è bloccata subito; con ZFS ARC sullo stesso NAS la pressione di memoria è un problema reale |
-| **A + opzione B** in seguito (come `bhyve -S`) | flessibile | un flag in più nell'ABI o in un sysctl |
-
-### D3. Cosa fare se vmm.ko viene caricato dopo nvmm.ko
-
-| Opzione | Pro | Contro |
-|---|---|---|
-| **A. nvmm.ko dichiara anche `MODULE_VERSION(vmm, 1)`** | il linker rifiuta vmm.ko *prima* di eseguire qualunque codice ("interface vmm.1 already present in the KLD 'nvmm.ko'"), quindi niente panic; bhyve fallisce in modo pulito | trucco: `kldstat -v` mostra "vmm" dentro nvmm.ko; un modulo con `MODULE_DEPEND(…, vmm, …)` si legherebbe a noi (in base non ce ne sono) |
-| **B. Solo documentazione + controllo al caricamento** | nessun trucco | resta il panic se qualcuno fa `kldload vmm` (o avvia bhyve, che carica vmm da solo) con nvmm attivo |
-| **C. Controllo periodico (`CR4`/stato VMX) e blocco delle VM** | rileva il problema | non previene il panic allo scarico di vmm.ko |
-
-Consiglio **A**, con un commento chiaro nel codice e una riga nel README.
-
-### Altre scelte minori (proposta, salvo tuo parere)
-
-- **Nome e posizione del repo:** `~/git-projects/freedomnas/freebsd-nvmm`,
-  commit solo locali, nessun remoto finché non lo crei tu.
-- **Permessi di `/dev/nvmm`:** `root:wheel 0600` nella fase 1; il gruppo
-  dedicato (DragonFly usa `nvmm`) lo decidiamo con il modulo VM.
-- **Commit:** messaggi brevi all'imperativo, senza trailer, come negli
-  altri repo FreedomNAS.
+| **D1. ABI verso userland** | **NetBSD**: kernel v2, libnvmm v2, `comm->stop` / `nvmm_vcpu_stop()`, `NVMM_VCPU_CONF_XCR0_MASK` | più completa; QEMU la usa già com'è. Più lavoro: base NetBSD convertita alle `os_*` (vedi §2) e comm page via `d_mmap_single`. |
+| **D2. Memoria guest** | **paginabile** (`OBJT_SWAP`, fault su EPT violation) | la cablata si aggiunge dopo, quando la paginabile è stabile: una cosa alla volta, per sapere da dove arrivano i problemi. |
+| **D3. vmm.ko caricato dopo nvmm.ko** | nvmm.ko dichiara anche **`MODULE_VERSION(vmm, 1)`** | il linker rifiuta vmm.ko prima di eseguirne il codice; più il controllo al caricamento di nvmm.ko se vmm è già presente. |
+| Permessi di `/dev/nvmm` | `root:wheel 0600` nella fase 1 | il gruppo dedicato si decide con il modulo VM di FreedomNAS. |
+| Repo | `~/git-projects/freedomnas/freebsd-nvmm`, commit locali | nessun remoto finché non lo crei tu. |
 
 ---
 
-## 7. Build: cosa posso fare io e cosa devi fare tu
+## 7. Build e test
 
-La mia macchina è Gentoo su AMD Ryzen: niente FreeBSD nativo e niente VMX
-annidato. Posso però **compilare** il modulo dentro una VM FreeBSD
-15.1-RELEASE (l'immagine qcow2 ufficiale è già nella cache della CI,
-`/var/cache/freedomnas-ci/freebsd/`; userei un overlay in `/dev/shm`,
-senza toccare l'originale). Lì faccio solo `make`, nessun `kldload`.
+La compilazione si fa sulla macchina di test (Intel i5), avviata da un
+disco dedicato con **solo FreeBSD 15.1**: nessun FreedomNAS, così il
+disco di FreedomNAS resta com'è.
 
-Sulla tua macchina di test, a fase 1 finita, i comandi saranno questi (li
-riconfermo con i percorsi esatti quando il codice c'è):
+Il disco (Hitachi 320 GB) si prepara dal PC con
+`tools/devbox/make-devbox.sh`. Lo script usa `freebsd/qemu-driver.sh`
+dell'image builder senza modificarlo: avvia l'immagine VM ufficiale di
+FreeBSD 15.1 e le passa il disco come secondo disco, poi
+`tools/devbox/devbox-in-guest.sh` fa questo:
+
+- GPT su tutto il disco: `freebsd-boot` (gptboot, avvio BIOS), ESP FAT32
+  (avvio UEFI), swap 8 GiB, UFS per il resto; etichette `nvmm*`, quindi il
+  disco si sposta su qualunque macchina;
+- sistema base da pkgbase (`FreeBSD-set-minimal`, `-base`, `-kernels`:
+  compilatore e header inclusi) all'ultimo patch level di 15.1, con il
+  repository FreeBSD-base attivo per `pkg upgrade`;
+- `git-lite`, `sudo`, `rsync`; sorgenti `releng/15.1` in `/usr/src`
+  (stesso patch level del kernel);
+- `sshd`, DHCP su qualunque scheda, hostname `nvmm-dev`, utente `admin`
+  (gruppo wheel, sudo senza password) e `root` con password
+  `freedomnas` e la tua chiave SSH.
+
+Sulla macchina di test:
 
 ```sh
-# sorgenti del kernel 15.1 (se /usr/src/sys non c'è)
-git clone --depth 1 -b releng/15.1 https://github.com/freebsd/freebsd-src.git /usr/src
 cd /percorso/freebsd-nvmm/sys/modules/nvmm
-make SYSDIR=/usr/src/sys
-kldload ./nvmm.ko && dmesg | tail
+make
+kldload ./nvmm.ko && dmesg | tail      # solo tu, sull'hardware di test
 ```
+
+Io lì compilo e basta: `kldload`/`kldunload` li fai tu.
