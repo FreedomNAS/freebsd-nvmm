@@ -1,0 +1,6 @@
+refs/
+*.ko
+*.o
+*.kld
+*.full
+*.debug
