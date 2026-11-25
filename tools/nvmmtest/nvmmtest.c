@@ -48,6 +48,7 @@
 
 #include <err.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -1505,6 +1506,260 @@ out:
 	check_counters("run fpu");
 }
 
+/* -------------------------------------------------------------------------- */
+
+/*
+ * Step 5e. A guest that never exits by itself ("jmp $") must still give
+ * the CPU back: on a signal, on comm->stop, when the scheduler wants the
+ * CPU, and when the process is killed.
+ */
+static const uint8_t guest_spin_forever[] = {
+	0xEB, 0xFE,	/* 1400: jmp 1400 */
+};
+
+#define NSPIN	8
+
+struct forever_ctx {
+	int fd;
+	nvmm_machid_t machid;
+	nvmm_cpuid_t cpuid;
+	_Atomic bool done;
+	_Atomic int nreturns;	/* ioctls that came back */
+	_Atomic uint64_t last_reason;
+	int error;
+};
+
+static void
+sigusr1(int sig __unused)
+{
+}
+
+static void *
+forever_runner(void *arg)
+{
+	struct forever_ctx *ctx = arg;
+	struct nvmm_vcpu_exit exit;
+	int error;
+
+	while (!atomic_load(&ctx->done)) {
+		error = vcpu_run(ctx->fd, ctx->machid, ctx->cpuid, &exit);
+		if (error != 0 && error != EINTR) {
+			ctx->error = error;
+			break;
+		}
+		atomic_store(&ctx->last_reason, exit.reason);
+		atomic_fetch_add(&ctx->nreturns, 1);
+		if (exit.reason == NVMM_VCPU_EXIT_STOPPED)
+			break;
+		if (exit.reason != NVMM_VCPU_EXIT_NONE) {
+			ctx->error = -1;
+			break;
+		}
+	}
+	return NULL;
+}
+
+static double
+elapsed_ms(const struct timespec *t0)
+{
+	struct timespec t1;
+
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	return ((t1.tv_sec - t0->tv_sec) * 1e9 +
+	    (t1.tv_nsec - t0->tv_nsec)) / 1e6;
+}
+
+/* Wait until ctx->nreturns > n, at most 1 s. */
+static double
+wait_return(struct forever_ctx *ctx, int n)
+{
+	struct timespec t0;
+	double ms;
+
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (atomic_load(&ctx->nreturns) <= n) {
+		ms = elapsed_ms(&t0);
+		if (ms > 1000)
+			return -1;
+		usleep(100);
+	}
+	return elapsed_ms(&t0);
+}
+
+static bool
+spin_machine(int fd, nvmm_machid_t machid, u_int nvcpu, uint8_t **memp)
+{
+	size_t ps = (size_t)getpagesize();
+	struct nvmm_comm_page *comm;
+	uint8_t *mem;
+	u_int c;
+
+	mem = mmap(NULL, 4 * ps, PROT_READ | PROT_WRITE, MAP_ANON |
+	    MAP_PRIVATE, -1, 0);
+	if (mem == MAP_FAILED)
+		return false;
+	if (hva_map(fd, machid, mem, 4 * ps) != 0 ||
+	    gpa_map(fd, machid, mem, 0, 4 * ps,
+	    PROT_READ | PROT_WRITE | PROT_EXEC) != 0)
+		return false;
+	memset(mem, 0, 4 * ps);
+	memcpy(mem + 0x1400, guest_spin_forever, sizeof(guest_spin_forever));
+	for (c = 0; c < nvcpu; c++) {
+		if (vcpu_create(fd, machid, c) != 0)
+			return false;
+		comm = comm_map(fd, machid, c);
+		comm->state_wanted = NVMM_X64_STATE_ALL;
+		comm->state_cached = 0;
+		{
+			struct nvmm_ioc_vcpu_getstate a = {
+				.machid = machid, .cpuid = c
+			};
+			if (ioctl(fd, NVMM_IOC_VCPU_GETSTATE, &a) == -1)
+				return false;
+		}
+		comm->state.segs[NVMM_X64_SEG_CS].selector = 0;
+		comm->state.segs[NVMM_X64_SEG_CS].base = 0;
+		comm->state.gprs[NVMM_X64_GPR_RIP] = 0x1400;
+		comm->state_commit = NVMM_X64_STATE_SEGS | NVMM_X64_STATE_GPRS;
+		munmap(comm, ps);
+	}
+	*memp = mem;
+	return true;
+}
+
+static void
+test_run_signals(int fd)
+{
+	struct forever_ctx ctx[NSPIN];
+	struct nvmm_comm_page *comm;
+	struct sigaction sa;
+	struct timespec t0;
+	pthread_t thr[NSPIN];
+	nvmm_machid_t machid;
+	uint8_t *mem;
+	double ms, worst;
+	int error, i, n, minret;
+	pid_t pid;
+	int status;
+
+	printf("run: guest that never exits: signal, stop, preemption, kill\n");
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = sigusr1;	/* no SA_RESTART */
+	sigaction(SIGUSR1, &sa, NULL);
+
+	error = machine_create(fd, &machid);
+	check(error == 0, "machine: %s", strerror(error));
+	if (error)
+		return;
+	if (!spin_machine(fd, machid, NSPIN, &mem)) {
+		check(false, "spin machine setup");
+		goto out;
+	}
+
+	/* 1. A signal to the thread running the vCPU. */
+	memset(&ctx[0], 0, sizeof(ctx[0]));
+	ctx[0].fd = fd;
+	ctx[0].machid = machid;
+	ctx[0].cpuid = 0;
+	pthread_create(&thr[0], NULL, forever_runner, &ctx[0]);
+	usleep(200000);
+	/* Informational: preemption may bring it back now and then. */
+	printf("  spinning alone for 200 ms: back in userland %d times\n",
+	    atomic_load(&ctx[0].nreturns));
+	n = atomic_load(&ctx[0].nreturns);
+	pthread_kill(thr[0], SIGUSR1);
+	ms = wait_return(&ctx[0], n);
+	check(ms >= 0, "signal: vcpu_run did not return within 1 s");
+	printf("  signal: back in userland after %.2f ms\n", ms);
+
+	/* 2. comm->stop. */
+	comm = comm_map(fd, machid, 0);
+	usleep(50000);
+	n = atomic_load(&ctx[0].nreturns);
+	comm->stop = 1;
+	ms = wait_return(&ctx[0], n);
+	check(ms >= 0, "stop: vcpu_run did not return within 1 s");
+	pthread_join(thr[0], NULL);
+	check(atomic_load(&ctx[0].last_reason) == NVMM_VCPU_EXIT_STOPPED,
+	    "stop: last exit 0x%jx, expected STOPPED",
+	    (uintmax_t)atomic_load(&ctx[0].last_reason));
+	check(comm->stop == 0, "stop flag not cleared by the kernel");
+	printf("  stop: STOPPED after %.2f ms\n", ms);
+	munmap(comm, getpagesize());
+
+	/* 3. NSPIN spinning vCPUs on fewer host CPUs for 2 s. */
+	for (i = 0; i < NSPIN; i++) {
+		memset(&ctx[i], 0, sizeof(ctx[i]));
+		ctx[i].fd = fd;
+		ctx[i].machid = machid;
+		ctx[i].cpuid = i;
+		pthread_create(&thr[i], NULL, forever_runner, &ctx[i]);
+	}
+	worst = 0;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < 2000) {
+		struct timespec s0;
+
+		clock_gettime(CLOCK_MONOTONIC, &s0);
+		usleep(10000);
+		ms = elapsed_ms(&s0) - 10;
+		if (ms > worst)
+			worst = ms;
+	}
+	for (i = 0; i < NSPIN; i++) {
+		struct nvmm_comm_page *c = comm_map(fd, machid, i);
+
+		atomic_store(&ctx[i].done, true);
+		c->stop = 1;
+		munmap(c, getpagesize());
+	}
+	minret = INT32_MAX;
+	for (i = 0; i < NSPIN; i++) {
+		pthread_join(thr[i], NULL);
+		check(ctx[i].error == 0, "vcpu %d: error %d", i, ctx[i].error);
+		if (atomic_load(&ctx[i].nreturns) < minret)
+			minret = atomic_load(&ctx[i].nreturns);
+	}
+	check(minret > 1, "a spinning vCPU never gave the CPU back");
+	check(worst < 500, "host thread delayed %.1f ms by spinning guests",
+	    worst);
+	printf("  %d spinning vCPUs for 2 s: each back in userland >= %d "
+	    "times, worst extra host sleep delay %.2f ms\n", NSPIN, minret,
+	    worst);
+
+	/* 4. A child with a spinning vCPU, killed. */
+	pid = fork();
+	if (pid == -1)
+		err(1, "fork");
+	if (pid == 0) {
+		struct nvmm_vcpu_exit exit;
+		nvmm_machid_t m;
+		uint8_t *cm;
+		int cfd = open_nvmm();
+
+		if (machine_create(cfd, &m) != 0 ||
+		    !spin_machine(cfd, m, 1, &cm))
+			_exit(2);
+		for (;;)
+			(void)vcpu_run(cfd, m, 0, &exit);
+	}
+	usleep(300000);
+	kill(pid, SIGKILL);
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	if (waitpid(pid, &status, 0) == -1)
+		err(1, "waitpid");
+	ms = elapsed_ms(&t0);
+	check(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL,
+	    "child status 0x%x", status);
+	printf("  child with a spinning vCPU killed in %.2f ms\n", ms);
+
+	munmap(mem, 4 * getpagesize());
+out:
+	error = machine_destroy(fd, machid);
+	check(error == 0, "destroy machine: %s", strerror(error));
+	check_counters("run signals");
+}
+
 /*
  * A child opens its own /dev/nvmm, creates machines and vCPUs, maps their
  * comm pages and exits without destroying anything: closing the
@@ -1595,6 +1850,7 @@ main(int argc, char **argv)
 	test_run_ept(fd);
 	test_run_cpuid_msr(fd);
 	test_run_fpu(fd);
+	test_run_signals(fd);
 	close(fd);
 	if (!only_run)
 		test_exit_without_destroy();
