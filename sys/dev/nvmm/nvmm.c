@@ -1188,17 +1188,30 @@ nvmm_comm_object(struct nvmm_owner *owner, uint64_t off, size_t size,
 }
 
 /*
- * Phase 1 of the FreeBSD port: only the capability query is wired up.
- * The other requests answer ENOSYS until their backend parts are ported.
+ * FreeBSD port, phase 3: machines and vCPUs are wired up. Guest memory
+ * (phase 4) and vcpu_run (phase 5) answer ENOSYS until they are ported.
  */
-static const bool nvmm_ioctl_full = false;
+static bool
+nvmm_ioctl_ported(unsigned long cmd)
+{
+	switch (cmd) {
+	case NVMM_IOC_VCPU_RUN:
+	case NVMM_IOC_GPA_MAP:
+	case NVMM_IOC_GPA_UNMAP:
+	case NVMM_IOC_HVA_MAP:
+	case NVMM_IOC_HVA_UNMAP:
+		return false;
+	default:
+		return true;
+	}
+}
 
 static int
 nvmm_ioctl_internal(struct nvmm_owner *owner, unsigned long cmd, void *data)
 {
 	OS_ASSERT(owner != NULL);
 
-	if (!nvmm_ioctl_full && cmd != NVMM_IOC_CAPABILITY)
+	if (!nvmm_ioctl_ported(cmd))
 		return ENOSYS;
 
 	switch (cmd) {

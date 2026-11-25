@@ -497,7 +497,12 @@ nvmm_dev_mmap_single(struct cdev *dev __unused, vm_ooffset_t *offset,
 	if (error)
 		return error;
 
-	/* vm_mmap_cdev() consumes the reference taken by nvmm_comm_object(). */
+	/*
+	 * vm_mmap_cdev() consumes the reference taken by nvmm_comm_object():
+	 * it now belongs to the process mapping, which drops it without
+	 * going through os_vmobj_rel(), so it leaves the hw.nvmm count here.
+	 */
+	NVMM_VMOBJS_SUB();
 	*objp = vmobj;
 	*offset = objoff;
 	return 0;
