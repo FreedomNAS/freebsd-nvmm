@@ -5,7 +5,7 @@
 
 KMOD=	nvmm
 SRCS=	nvmm.c nvmm_freebsd.c
-SRCS+=	nvmm_x86.c nvmm_x86_vmx.c
+SRCS+=	nvmm_x86.c nvmm_x86_vmx.c nvmm_x86_vmxfunc.S
 # <x86/apicvar.h> pulls in <sys/bus.h>, which wants the generated headers.
 SRCS+=	bus_if.h device_if.h
 

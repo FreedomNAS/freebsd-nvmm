@@ -31,7 +31,7 @@
 #ifndef _NVMM_X86_H_
 #define _NVMM_X86_H_
 
-#if defined(__FreeBSD__)
+#if defined(__FreeBSD__) && !defined(ASM_NVMM)
 #include <dev/nvmm/nvmm_bitops.h>
 #endif
 
