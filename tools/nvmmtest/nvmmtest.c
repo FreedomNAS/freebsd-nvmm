@@ -1149,6 +1149,193 @@ out:
 	check_counters("run ept");
 }
 
+/* -------------------------------------------------------------------------- */
+
+/*
+ * Step 5c. CPUID, MSRs and CR0, each followed by "out 0x84,al" so that
+ * userland sees the registers (an I/O exit provides the GPRs).
+ */
+static const uint8_t guest_cpuid_msr[] = {
+	0x66, 0x31, 0xC0,			/* 1200: xor eax,eax */
+	0x0F, 0xA2,				/* 1203: cpuid */
+	0xE6, 0x84,				/* 1205: out  [vendor] */
+	0x66, 0xB8, 0x00, 0x00, 0x00, 0x40,	/* 1207: mov eax,0x40000000 */
+	0x0F, 0xA2,				/* 120D: cpuid */
+	0xE6, 0x84,				/* 120F: out  [hypervisor] */
+	0x66, 0xB8, 0x01, 0x00, 0x00, 0x00,	/* 1211: mov eax,1 */
+	0x0F, 0xA2,				/* 1217: cpuid */
+	0xE6, 0x84,				/* 1219: out  [leaf 1] */
+	0x66, 0xB8, 0x06, 0x00, 0x00, 0x00,	/* 121B: mov eax,6 */
+	0x0F, 0xA2,				/* 1221: cpuid (exit: configured) */
+	0xE6, 0x84,				/* 1223: out  [userland value] */
+	0x66, 0xB9, 0x1B, 0x00, 0x00, 0x00,	/* 1225: mov ecx,0x1B */
+	0x0F, 0x32,				/* 122B: rdmsr (exit: APIC base) */
+	0xE6, 0x84,				/* 122D: out  [userland value] */
+	0x66, 0xB9, 0x77, 0x02, 0x00, 0x00,	/* 122F: mov ecx,0x277 */
+	0x0F, 0x32,				/* 1235: rdmsr (in kernel: PAT) */
+	0xE6, 0x84,				/* 1237: out  [PAT] */
+	0x0F, 0x20, 0xC0,			/* 1239: mov eax,cr0 */
+	0x66, 0x25, 0xFF, 0xFF, 0xFF, 0x9F,	/* 123C: and eax,~(CD|NW) */
+	0x0F, 0x22, 0xC0,			/* 1242: mov cr0,eax (CR exit) */
+	0x0F, 0x20, 0xC3,			/* 1245: mov ebx,cr0 */
+	0xE6, 0x84,				/* 1248: out  [cr0] */
+	0xF4,					/* 124A: hlt */
+};
+
+static bool
+next_out84(int fd, nvmm_machid_t machid, struct nvmm_comm_page *comm,
+    const char *what)
+{
+	struct nvmm_vcpu_exit exit;
+	int error;
+
+	error = run_until(fd, machid, &exit);
+	if (!expect_exit(what, error, &exit, NVMM_VCPU_EXIT_IO))
+		return false;
+	if (exit.u.io.port != 0x84) {
+		check(false, "%s: out to port 0x%x", what, exit.u.io.port);
+		return false;
+	}
+	skip_io(comm, &exit);
+	return true;
+}
+
+static void
+test_run_cpuid_msr(int fd)
+{
+	size_t ps = (size_t)getpagesize();
+	struct nvmm_vcpu_conf_cpuid conf;
+	struct nvmm_vcpu_exit exit;
+	struct nvmm_comm_page *comm;
+	uint64_t *gpr;
+	nvmm_machid_t machid;
+	uint8_t *mem;
+	char id[13];
+	int error;
+
+	printf("run: CPUID, MSRs, CR0\n");
+	error = machine_create(fd, &machid);
+	check(error == 0, "machine: %s", strerror(error));
+	if (error)
+		return;
+	error = vcpu_create(fd, machid, 0);
+	check(error == 0, "vcpu: %s", strerror(error));
+	if (error)
+		goto out;
+	comm = comm_map(fd, machid, 0);
+	gpr = comm->state.gprs;
+
+	mem = mmap(NULL, 4 * ps, PROT_READ | PROT_WRITE, MAP_ANON |
+	    MAP_PRIVATE, -1, 0);
+	if (mem == MAP_FAILED)
+		err(1, "mmap");
+	if (hva_map(fd, machid, mem, 4 * ps) != 0 ||
+	    gpa_map(fd, machid, mem, 0, 4 * ps,
+	    PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+		check(false, "guest memory");
+		goto out;
+	}
+	memset(mem, 0, 4 * ps);
+	memcpy(mem + 0x1200, guest_cpuid_msr, sizeof(guest_cpuid_msr));
+
+	memset(&conf, 0, sizeof(conf));
+	conf.exit = 1;
+	conf.leaf = 0x00000006;
+	error = vcpu_configure(fd, machid, 0, NVMM_VCPU_CONF_CPUID, &conf);
+	check(error == 0, "conf cpuid 6 exit: %s", strerror(error));
+
+	if (!set_real_mode_rip(fd, machid, comm, 0x1200)) {
+		check(false, "state");
+		goto out;
+	}
+
+	/* Leaf 0: the host vendor, max basic leaf clipped. */
+	if (!next_out84(fd, machid, comm, "cpuid 0"))
+		goto out;
+	memcpy(id, &gpr[NVMM_X64_GPR_RBX], 4);
+	memcpy(id + 4, &gpr[NVMM_X64_GPR_RDX], 4);
+	memcpy(id + 8, &gpr[NVMM_X64_GPR_RCX], 4);
+	id[12] = '\0';
+	check(strcmp(id, "GenuineIntel") == 0, "cpuid 0 vendor \"%s\"", id);
+	check((uint32_t)gpr[NVMM_X64_GPR_RAX] <= 0x16,
+	    "cpuid 0 max leaf 0x%jx", (uintmax_t)gpr[NVMM_X64_GPR_RAX]);
+	printf("  vendor %s, max basic leaf 0x%jx\n", id,
+	    (uintmax_t)(uint32_t)gpr[NVMM_X64_GPR_RAX]);
+
+	/* Leaf 0x40000000: the NVMM signature. */
+	if (!next_out84(fd, machid, comm, "cpuid 0x40000000"))
+		goto out;
+	memcpy(id, &gpr[NVMM_X64_GPR_RBX], 4);
+	memcpy(id + 4, &gpr[NVMM_X64_GPR_RCX], 4);
+	memcpy(id + 8, &gpr[NVMM_X64_GPR_RDX], 4);
+	check(memcmp(id, "___ NVMM ___", 12) == 0,
+	    "cpuid 0x40000000 signature \"%.12s\"", id);
+
+	/* Leaf 1: VMX hidden, hypervisor bit set, APIC ID = vCPU 0. */
+	if (!next_out84(fd, machid, comm, "cpuid 1"))
+		goto out;
+	check((gpr[NVMM_X64_GPR_RCX] & 0x20) == 0, "cpuid 1: VMX visible");
+	check((gpr[NVMM_X64_GPR_RCX] & 0x80000000U) != 0,
+	    "cpuid 1: hypervisor bit clear");
+	check(((gpr[NVMM_X64_GPR_RBX] >> 24) & 0xFF) == 0,
+	    "cpuid 1: APIC ID %ju", (uintmax_t)((gpr[NVMM_X64_GPR_RBX] >> 24) &
+	    0xFF));
+
+	/* Leaf 6, configured to exit: userland answers. */
+	error = run_until(fd, machid, &exit);
+	if (!expect_exit("cpuid 6", error, &exit, NVMM_VCPU_EXIT_CPUID))
+		goto out;
+	comm->state_wanted = NVMM_X64_STATE_GPRS;
+	comm->state_cached = 0;
+	(void)vcpu_ioctl(fd, NVMM_IOC_VCPU_GETSTATE, machid, 0);
+	gpr[NVMM_X64_GPR_RAX] = 0xABCD;
+	gpr[NVMM_X64_GPR_RIP] = exit.u.insn.npc;
+	comm->state_commit |= NVMM_X64_STATE_GPRS;
+	if (!next_out84(fd, machid, comm, "after cpuid 6"))
+		goto out;
+	check((gpr[NVMM_X64_GPR_RAX] & 0xFFFF) == 0xABCD,
+	    "cpuid 6: eax 0x%jx", (uintmax_t)gpr[NVMM_X64_GPR_RAX]);
+
+	/* RDMSR of the APIC base: not in the kernel, userland answers. */
+	error = run_until(fd, machid, &exit);
+	if (!expect_exit("rdmsr 0x1B", error, &exit, NVMM_VCPU_EXIT_RDMSR))
+		goto out;
+	check(exit.u.rdmsr.msr == 0x1B, "rdmsr: msr 0x%x", exit.u.rdmsr.msr);
+	gpr[NVMM_X64_GPR_RAX] = 0xFEE00900;
+	gpr[NVMM_X64_GPR_RDX] = 0;
+	gpr[NVMM_X64_GPR_RIP] = exit.u.rdmsr.npc;
+	comm->state_commit |= NVMM_X64_STATE_GPRS;
+	if (!next_out84(fd, machid, comm, "after rdmsr 0x1B"))
+		goto out;
+	check((uint32_t)gpr[NVMM_X64_GPR_RAX] == 0xFEE00900,
+	    "rdmsr 0x1B: eax 0x%jx", (uintmax_t)gpr[NVMM_X64_GPR_RAX]);
+
+	/* RDMSR of the PAT: in the kernel, the guest's reset value. */
+	if (!next_out84(fd, machid, comm, "rdmsr PAT"))
+		goto out;
+	check(((uint32_t)gpr[NVMM_X64_GPR_RDX] == 0x00070406) &&
+	    ((uint32_t)gpr[NVMM_X64_GPR_RAX] == 0x00070406),
+	    "rdmsr PAT: edx:eax 0x%08jx:%08jx",
+	    (uintmax_t)(uint32_t)gpr[NVMM_X64_GPR_RDX],
+	    (uintmax_t)(uint32_t)gpr[NVMM_X64_GPR_RAX]);
+
+	/* CR0 write (CD/NW cleared): handled in the kernel. */
+	if (!next_out84(fd, machid, comm, "cr0"))
+		goto out;
+	check((gpr[NVMM_X64_GPR_RBX] & 0x60000000) == 0 &&
+	    (gpr[NVMM_X64_GPR_RBX] & 0x10) != 0,
+	    "cr0 after write 0x%jx", (uintmax_t)gpr[NVMM_X64_GPR_RBX]);
+
+	error = run_until(fd, machid, &exit);
+	expect_exit("final hlt", error, &exit, NVMM_VCPU_EXIT_HALTED);
+
+	munmap(comm, ps);
+out:
+	error = machine_destroy(fd, machid);
+	check(error == 0, "destroy machine: %s", strerror(error));
+	check_counters("run cpuid/msr");
+}
+
 /*
  * A child opens its own /dev/nvmm, creates machines and vCPUs, maps their
  * comm pages and exits without destroying anything: closing the
@@ -1236,6 +1423,7 @@ main(int argc, char **argv)
 	}
 	test_run(fd);
 	test_run_ept(fd);
+	test_run_cpuid_msr(fd);
 	close(fd);
 	if (!only_run)
 		test_exit_without_destroy();
