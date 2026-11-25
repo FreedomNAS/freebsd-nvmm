@@ -46,6 +46,8 @@
 #include <sys/wait.h>
 
 #include <err.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
@@ -936,6 +938,217 @@ out:
 	check_counters("run");
 }
 
+/* -------------------------------------------------------------------------- */
+
+/*
+ * Step 5b. A guest that spins reading gpa 0x3000 and reports each new
+ * value with "out 0x83,al", while another thread remaps that page onto
+ * host pages with different contents. Each remap goes through
+ * pmap_invalidate_ept() with the vCPU possibly in the guest; if a stale
+ * translation survived, the guest would keep reading the old page.
+ *
+ *   1000: mov al,[0x3000] ; mov ah,al
+ *   1005: mov al,[0x3000] ; cmp al,ah ; je 1005
+ *   100C: out 0x83,al ; mov ah,al ; jmp 1005
+ *   1100: mov byte [0x5000],0x42	(MMIO: 0x5000 is not mapped)
+ */
+static const uint8_t guest_spin[] = {
+	0xA0, 0x00, 0x30,	/* 1000: mov al,[0x3000] */
+	0x88, 0xC4,		/* 1003: mov ah,al */
+	0xA0, 0x00, 0x30,	/* 1005: mov al,[0x3000] */
+	0x38, 0xE0,		/* 1008: cmp al,ah */
+	0x74, 0xF9,		/* 100A: je 1005 */
+	0xE6, 0x83,		/* 100C: out 0x83,al */
+	0x88, 0xC4,		/* 100E: mov ah,al */
+	0xEB, 0xF3,		/* 1010: jmp 1005 */
+};
+static const uint8_t guest_mmio[] = {
+	0xC6, 0x06, 0x00, 0x50, 0x42,	/* 1100: mov byte [0x5000],0x42 */
+	0xF4,				/* 1105: hlt */
+};
+
+#define REMAP_NPAGES	16
+#define REMAP_ROUNDS	1000
+#define REMAP_LAST	0xFF
+
+struct spin_ctx {
+	int fd;
+	nvmm_machid_t machid;
+	struct nvmm_comm_page *comm;
+	_Atomic int seen;	/* last value the guest reported, -1: none */
+	_Atomic int nexits;
+	int error;
+	uint64_t bad_reason;
+};
+
+static void *
+spin_runner(void *arg)
+{
+	struct spin_ctx *ctx = arg;
+	struct nvmm_vcpu_exit exit;
+	int error, value;
+
+	for (;;) {
+		error = vcpu_run(ctx->fd, ctx->machid, 0, &exit);
+		if (error != 0) {
+			ctx->error = error;
+			break;
+		}
+		atomic_fetch_add(&ctx->nexits, 1);
+		if (exit.reason == NVMM_VCPU_EXIT_NONE)
+			continue;
+		if (exit.reason != NVMM_VCPU_EXIT_IO || exit.u.io.port != 0x83) {
+			ctx->bad_reason = exit.reason;
+			break;
+		}
+		value = (int)(ctx->comm->state.gprs[NVMM_X64_GPR_RAX] & 0xFF);
+		skip_io(ctx->comm, &exit);
+		atomic_store(&ctx->seen, value);
+		if (value == REMAP_LAST)
+			break;
+	}
+	return NULL;
+}
+
+static bool
+set_real_mode_rip(int fd, nvmm_machid_t machid, struct nvmm_comm_page *comm,
+    uint64_t rip)
+{
+	comm->state_wanted = NVMM_X64_STATE_ALL;
+	comm->state_cached = 0;
+	if (vcpu_ioctl(fd, NVMM_IOC_VCPU_GETSTATE, machid, 0) != 0)
+		return false;
+	comm->state.segs[NVMM_X64_SEG_CS].selector = 0;
+	comm->state.segs[NVMM_X64_SEG_CS].base = 0;
+	comm->state.gprs[NVMM_X64_GPR_RIP] = rip;
+	comm->state.gprs[NVMM_X64_GPR_RSP] = 0x2FF0;
+	comm->state_commit = NVMM_X64_STATE_SEGS | NVMM_X64_STATE_GPRS;
+	return true;
+}
+
+static void
+test_run_ept(int fd)
+{
+	size_t ps = (size_t)getpagesize();
+	struct nvmm_vcpu_exit exit;
+	struct nvmm_comm_page *comm;
+	struct spin_ctx ctx;
+	struct timespec t0, t1;
+	nvmm_machid_t machid;
+	uint8_t *mem, *alt;
+	pthread_t thr;
+	int error, i, page, want, waited;
+	double ms;
+
+	printf("run: MMIO exit, EPT remapped under a running vCPU\n");
+	error = machine_create(fd, &machid);
+	check(error == 0, "machine: %s", strerror(error));
+	if (error)
+		return;
+	error = vcpu_create(fd, machid, 0);
+	check(error == 0, "vcpu: %s", strerror(error));
+	if (error)
+		goto out;
+	comm = comm_map(fd, machid, 0);
+
+	/* gpa 0-0x3FFF from mem; alt: the pages 0x3000 gets remapped to. */
+	mem = mmap(NULL, 4 * ps, PROT_READ | PROT_WRITE, MAP_ANON |
+	    MAP_PRIVATE, -1, 0);
+	alt = mmap(NULL, REMAP_NPAGES * ps, PROT_READ | PROT_WRITE,
+	    MAP_ANON | MAP_PRIVATE, -1, 0);
+	if (mem == MAP_FAILED || alt == MAP_FAILED)
+		err(1, "mmap");
+	if (hva_map(fd, machid, mem, 4 * ps) != 0 ||
+	    hva_map(fd, machid, alt, REMAP_NPAGES * ps) != 0 ||
+	    gpa_map(fd, machid, mem, 0, 4 * ps,
+	    PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+		check(false, "guest memory");
+		goto out;
+	}
+	memset(mem, 0, 4 * ps);
+	memcpy(mem + 0x1000, guest_spin, sizeof(guest_spin));
+	memcpy(mem + 0x1100, guest_mmio, sizeof(guest_mmio));
+	for (i = 0; i < REMAP_NPAGES; i++)
+		memset(alt + i * ps, 0, ps);
+
+	/* MMIO: a write to unmapped 0x5000 comes back as a memory exit. */
+	if (!set_real_mode_rip(fd, machid, comm, 0x1100)) {
+		check(false, "state");
+		goto out;
+	}
+	error = run_until(fd, machid, &exit);
+	if (expect_exit("mmio write", error, &exit, NVMM_VCPU_EXIT_MEMORY)) {
+		check(exit.u.mem.gpa == 0x5000 &&
+		    exit.u.mem.prot == PROT_WRITE, "mmio write: gpa 0x%jx "
+		    "prot %d", (uintmax_t)exit.u.mem.gpa, exit.u.mem.prot);
+		check(comm->state.gprs[NVMM_X64_GPR_RIP] == 0x1100,
+		    "mmio write: rip 0x%jx, the faulting instruction",
+		    (uintmax_t)comm->state.gprs[NVMM_X64_GPR_RIP]);
+	}
+
+	/* The spinning guest, from 0x1000, reading 0 at 0x3000. */
+	if (!set_real_mode_rip(fd, machid, comm, 0x1000)) {
+		check(false, "state");
+		goto out;
+	}
+	memset(&ctx, 0, sizeof(ctx));
+	ctx.fd = fd;
+	ctx.machid = machid;
+	ctx.comm = comm;
+	atomic_store(&ctx.seen, -1);
+	if (pthread_create(&thr, NULL, spin_runner, &ctx) != 0)
+		err(1, "pthread_create");
+	usleep(100000);	/* let the guest read the first value */
+
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	for (i = 1; i <= REMAP_ROUNDS; i++) {
+		page = i % REMAP_NPAGES;
+		want = (i == REMAP_ROUNDS) ? REMAP_LAST : (i % 200) + 1;
+		memset(alt + page * ps, want, ps);
+		error = gpa_unmap(fd, machid, 0x3000, ps);
+		if (error == 0)
+			error = gpa_map(fd, machid, alt + page * ps, 0x3000,
+			    ps, PROT_READ | PROT_WRITE);
+		if (error != 0) {
+			check(false, "remap %d: %s", i, strerror(error));
+			break;
+		}
+		/* The guest must see the new value: 1s at most. */
+		for (waited = 0; waited < 1000; waited++) {
+			if (atomic_load(&ctx.seen) == want ||
+			    ctx.error != 0 || ctx.bad_reason != 0)
+				break;
+			usleep(1000);
+		}
+		if (atomic_load(&ctx.seen) != want) {
+			check(false, "remap %d: guest still sees %d, want %d "
+			    "(stale EPT translation?) runner error %d exit "
+			    "0x%jx", i, atomic_load(&ctx.seen), want,
+			    ctx.error, (uintmax_t)ctx.bad_reason);
+			break;
+		}
+	}
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	if (i <= REMAP_ROUNDS) {
+		/* Unblock the runner: it stops on the last value. */
+		memset(alt, REMAP_LAST, ps);
+		(void)gpa_unmap(fd, machid, 0x3000, ps);
+		(void)gpa_map(fd, machid, alt, 0x3000, ps, PROT_READ);
+	}
+	pthread_join(thr, NULL);
+	ms = ((t1.tv_sec - t0.tv_sec) * 1e9 + (t1.tv_nsec - t0.tv_nsec)) / 1e6;
+	if (i > REMAP_ROUNDS)
+		printf("  %d remaps seen by the running guest, %.3f ms each, "
+		    "%d exits\n", REMAP_ROUNDS, ms / REMAP_ROUNDS,
+		    atomic_load(&ctx.nexits));
+
+	munmap(comm, ps);
+out:
+	error = machine_destroy(fd, machid);
+	check(error == 0, "destroy machine: %s", strerror(error));
+	check_counters("run ept");
+}
+
 /*
  * A child opens its own /dev/nvmm, creates machines and vCPUs, maps their
  * comm pages and exits without destroying anything: closing the
@@ -1022,6 +1235,7 @@ main(int argc, char **argv)
 		test_memory(fd);
 	}
 	test_run(fd);
+	test_run_ept(fd);
 	close(fd);
 	if (!only_run)
 		test_exit_without_destroy();
