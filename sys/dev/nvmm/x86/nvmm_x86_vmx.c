@@ -30,18 +30,20 @@
  */
 
 /*
- * Intel VMX backend, phase 1 of the FreeBSD port.
+ * Intel VMX backend, phase 2 of the FreeBSD port.
  *
- * Only the identification (vmx_ident) and the capability report are real,
- * taken from NetBSD's nvmm_x86_vmx.c. VMXON, VMCS management and vcpu_run
- * come with the next phases; until then the other operations are stubs and
- * the frontend refuses the ioctls that would reach them.
+ * Real so far, taken from NetBSD's nvmm_x86_vmx.c: the identification
+ * (vmx_ident), the capability report, and VMXON/VMXOFF on every CPU at
+ * load/unload and across suspend/resume. VMCS management and vcpu_run come
+ * with the next phases; until then the other operations are stubs and the
+ * frontend refuses the ioctls that would reach them.
  */
 
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/kernel.h>
 #include <sys/mman.h>
+#include <sys/smp.h>
 
 #include <machine/cpufunc.h>
 #include <machine/md_var.h>
@@ -508,9 +510,204 @@ vmx_ident(void)
 	return true;
 }
 
+/* -------------------------------------------------------------------------- */
+
+/*
+ * VMXON regions, one page per CPU, indexed by FreeBSD cpuid. NetBSD panics
+ * when VMXON fails; here each CPU records its outcome in 'on' and 'error',
+ * and the CPU that called the rendezvous turns a failure into a refused
+ * load (decision F2-1 in PORTING.md).
+ */
+struct vmxon {
+	uint32_t ident;
+#define VMXON_IDENT_REVISION	__BITS(30,0)
+
+	uint8_t data[PAGE_SIZE - 4];
+} __packed;
+
+CTASSERT(sizeof(struct vmxon) == PAGE_SIZE);
+
+#define VMXCPU_OK		0
+#define VMXCPU_VMXE_IN_USE	1	/* CR4.VMXE already set */
+#define VMXCPU_FIRMWARE		2	/* feature control locked, VMX off */
+#define VMXCPU_VMXON_FAILED	3
+#define VMXCPU_VMXOFF_FAILED	4
+
+struct vmxoncpu {
+	struct vmxon *va;
+	vm_paddr_t pa;
+	bool on;
+	int error;
+};
+
+static struct vmxoncpu vmxoncpu[MAXCPU];
+static uint32_t vmx_revision __read_mostly;
+
+/*
+ * NetBSD has these in nvmm_x86_vmxfunc.S and panics on failure; inline here
+ * until vmlaunch/vmresume bring the assembly file (phase 5). VMfailInvalid
+ * sets CF, VMfailValid sets ZF: "setna" catches both.
+ */
+static inline bool
+vmx_vmxon(vm_paddr_t *pa)
+{
+	bool fail;
+
+	__asm volatile("vmxon %1\n\tsetna %0"
+	    : "=q" (fail) : "m" (*pa) : "cc", "memory");
+	return !fail;
+}
+
+static inline bool
+vmx_vmxoff(void)
+{
+	bool fail;
+
+	__asm volatile("vmxoff\n\tsetna %0"
+	    : "=q" (fail) : : "cc", "memory");
+	return !fail;
+}
+
+/* Rendezvous action: is another hypervisor already in VMX operation? */
 static void
+vmx_probe_cpu(void *arg __unused)
+{
+	struct vmxoncpu *vc = &vmxoncpu[curcpu];
+
+	vc->error = (rcr4() & CR4_VMXE) ? VMXCPU_VMXE_IN_USE : VMXCPU_OK;
+}
+
+/* Rendezvous action, from NetBSD's vmx_change_cpu(enable = true). */
+static void
+vmx_enable_cpu(void *arg __unused)
+{
+	struct vmxoncpu *vc = &vmxoncpu[curcpu];
+	uint64_t msr;
+
+	vc->error = VMXCPU_OK;
+	if (vc->on)
+		return;
+
+	msr = rdmsr(MSR_IA32_FEATURE_CONTROL);
+	if ((msr & IA32_FEATURE_CONTROL_LOCK) == 0) {
+		/* Lock now, with VMX-outside-SMX enabled. */
+		wrmsr(MSR_IA32_FEATURE_CONTROL, msr |
+		    IA32_FEATURE_CONTROL_LOCK |
+		    IA32_FEATURE_CONTROL_OUT_SMX);
+	} else if ((msr & IA32_FEATURE_CONTROL_OUT_SMX) == 0) {
+		/* vmx_ident checked the boot CPU only. */
+		vc->error = VMXCPU_FIRMWARE;
+		return;
+	}
+
+	load_cr4(rcr4() | CR4_VMXE);
+	vc->va->ident = __SHIFTIN(vmx_revision, VMXON_IDENT_REVISION);
+	if (!vmx_vmxon(&vc->pa)) {
+		load_cr4(rcr4() & ~CR4_VMXE);
+		vc->error = VMXCPU_VMXON_FAILED;
+		return;
+	}
+	vc->on = true;
+}
+
+/* Rendezvous action, from NetBSD's vmx_change_cpu(enable = false). */
+static void
+vmx_disable_cpu(void *arg __unused)
+{
+	struct vmxoncpu *vc = &vmxoncpu[curcpu];
+
+	vc->error = VMXCPU_OK;
+	if (!vc->on)
+		return;
+
+	if (!vmx_vmxoff()) {
+		/*
+		 * Still in VMX operation: clearing CR4.VMXE now would #GP.
+		 * Leave the CPU as it is and let the caller report it.
+		 */
+		vc->error = VMXCPU_VMXOFF_FAILED;
+		return;
+	}
+	load_cr4(rcr4() & ~CR4_VMXE);
+	vc->on = false;
+}
+
+static const char *
+vmx_cpu_strerror(int error)
+{
+	switch (error) {
+	case VMXCPU_VMXE_IN_USE:
+		return "VMX already in use by another hypervisor (CR4.VMXE set)";
+	case VMXCPU_FIRMWARE:
+		return "VMX disabled in the firmware";
+	case VMXCPU_VMXON_FAILED:
+		return "VMXON failed";
+	case VMXCPU_VMXOFF_FAILED:
+		return "VMXOFF failed";
+	default:
+		return "unknown error";
+	}
+}
+
+/* Prints every CPU that failed the last rendezvous; returns their number. */
+static u_int
+vmx_report_cpus(void)
+{
+	u_int cpu, nfailed = 0;
+
+	CPU_FOREACH(cpu) {
+		if (vmxoncpu[cpu].error == VMXCPU_OK)
+			continue;
+		os_printf("nvmm: CPU %u: %s\n", cpu,
+		    vmx_cpu_strerror(vmxoncpu[cpu].error));
+		nfailed++;
+	}
+	return nfailed;
+}
+
+/* VMXOFF everywhere; a CPU that cannot leave VMX keeps its region. */
+static void
+vmx_disable_all(void)
+{
+	smp_rendezvous(NULL, vmx_disable_cpu, NULL, NULL);
+	(void)vmx_report_cpus();
+}
+
+/* VMXON everywhere, or nowhere. */
+static int
+vmx_enable_all(void)
+{
+	smp_rendezvous(NULL, vmx_enable_cpu, NULL, NULL);
+	if (vmx_report_cpus() == 0)
+		return 0;
+
+	vmx_disable_all();
+	return ENXIO;
+}
+
+static void
+vmx_free_regions(void)
+{
+	u_int cpu;
+
+	CPU_FOREACH(cpu) {
+		struct vmxoncpu *vc = &vmxoncpu[cpu];
+
+		if (vc->va == NULL || vc->on)
+			continue;
+		os_pagemem_free(vc->va, PAGE_SIZE);
+		vc->va = NULL;
+		vc->pa = 0;
+	}
+}
+
+static int
 vmx_init(void)
 {
+	uint64_t msr;
+	u_int cpu;
+	int error;
+
 	/*
 	 * NetBSD uses x86_xsave_features, the XCR0 bits the CPU supports.
 	 * FreeBSD's xsave_mask is the subset the kernel enabled in XCR0 and
@@ -525,13 +722,57 @@ vmx_init(void)
 		    (uintmax_t)vmx_xcr0_mask);
 	}
 
-	/* VMXON on every CPU: phase 2. */
+	/*
+	 * Refuse to share VMX with another hypervisor: our VMXON would fail
+	 * and our VMXOFF would pull VMX from under it (decision F2-2).
+	 */
+	smp_rendezvous(NULL, vmx_probe_cpu, NULL, NULL);
+	if (vmx_report_cpus() != 0) {
+		os_printf("nvmm: not loading\n");
+		return EBUSY;
+	}
+
+	if (!vmx_rdmsr(MSR_IA32_VMX_BASIC, &msr))
+		return ENXIO;
+	vmx_revision = __SHIFTOUT(msr, IA32_VMX_BASIC_IDENT);
+
+	memset(vmxoncpu, 0, sizeof(vmxoncpu));
+	CPU_FOREACH(cpu) {
+		/* kmem pages are page-aligned; one page is contiguous. */
+		vmxoncpu[cpu].va = os_pagemem_zalloc(PAGE_SIZE);
+		vmxoncpu[cpu].pa = vtophys(vmxoncpu[cpu].va);
+	}
+
+	error = vmx_enable_all();
+	if (error) {
+		os_printf("nvmm: VMXON refused, not loading\n");
+		vmx_free_regions();
+		return error;
+	}
+
+	if (bootverbose)
+		os_printf("nvmm: VMXON on %d CPUs\n", mp_ncpus);
+	return 0;
 }
 
 static void
 vmx_fini(void)
 {
-	/* VMXOFF on every CPU: phase 2. */
+	vmx_disable_all();
+	vmx_free_regions();
+}
+
+static void
+vmx_suspend(void)
+{
+	vmx_disable_all();
+}
+
+static void
+vmx_resume(void)
+{
+	if (vmx_enable_all() != 0)
+		os_printf("nvmm: VMXON failed after resume\n");
 }
 
 static void
@@ -619,8 +860,8 @@ const struct nvmm_impl nvmm_x86_vmx = {
 	.init = vmx_init,
 	.fini = vmx_fini,
 	.suspend_interrupt = NULL,
-	.suspend = NULL,
-	.resume = NULL,
+	.suspend = vmx_suspend,
+	.resume = vmx_resume,
 	.capability = vmx_capability,
 	.mach_conf_max = NVMM_X86_MACH_NCONF,
 	.mach_conf_sizes = NULL,

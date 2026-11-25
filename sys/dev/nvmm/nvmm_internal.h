@@ -99,7 +99,8 @@ struct nvmm_machine {
 struct nvmm_impl {
 	const char *name;
 	bool (*ident)(void);
-	void (*init)(void);
+	/* FreeBSD: returns an errno, so that VMXON failures refuse the load. */
+	int (*init)(void);
 	void (*fini)(void);
 	void (*capability)(struct nvmm_capability *);
 	void (*suspend_interrupt)(void);

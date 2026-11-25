@@ -1063,10 +1063,29 @@ nvmm_ident(void)
 	return NULL;
 }
 
+static void
+nvmm_fini_locks(void)
+{
+	size_t i, n;
+
+	for (i = 0; i < NVMM_MAX_MACHINES; i++) {
+		os_rwl_destroy(&machines[i].lock);
+		for (n = 0; n < NVMM_MAX_VCPUS; n++) {
+			os_mtx_destroy(&machines[i].cpus[n].lock);
+		}
+	}
+
+	/* NetBSD does not destroy these. */
+	os_cv_destroy(&suspension.resumecv);
+	os_cv_destroy(&suspension.suspendcv);
+	os_mtx_destroy(&suspension.lock);
+}
+
 int
 nvmm_init(void)
 {
 	size_t i, n;
+	int error;
 
 	nvmm_impl = nvmm_ident();
 	if (nvmm_impl == NULL)
@@ -1087,7 +1106,12 @@ nvmm_init(void)
 	os_cv_init(&suspension.resumecv, "nvmmres");
 	suspension.users = 0;
 
-	(*nvmm_impl->init)();
+	error = (*nvmm_impl->init)();
+	if (error) {
+		nvmm_fini_locks();
+		nvmm_impl = NULL;
+		return error;
+	}
 
 	return 0;
 }
@@ -1095,19 +1119,7 @@ nvmm_init(void)
 void
 nvmm_fini(void)
 {
-	size_t i, n;
-
-	for (i = 0; i < NVMM_MAX_MACHINES; i++) {
-		os_rwl_destroy(&machines[i].lock);
-		for (n = 0; n < NVMM_MAX_VCPUS; n++) {
-			os_mtx_destroy(&machines[i].cpus[n].lock);
-		}
-	}
-
-	/* NetBSD does not destroy these. */
-	os_cv_destroy(&suspension.resumecv);
-	os_cv_destroy(&suspension.suspendcv);
-	os_mtx_destroy(&suspension.lock);
+	nvmm_fini_locks();
 
 	(*nvmm_impl->fini)();
 	nvmm_impl = NULL;
