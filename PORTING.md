@@ -331,7 +331,7 @@ serve solo con un guest in esecuzione: fase 5.
 
 | | Decisione | Note |
 |---|---|---|
-| **P5-1. Sotto-passi** | **5a** assembly, ciclo, uscite HLT/I/O, interrupt e NMI; **5b** uscite di memoria e protocollo EPT; **5c** CPUID con maschere, MSR, CR, XSETBV; **5d** FPU, registri di debug, TSC; **5e** segnali, `comm->stop`, prelazione. Ognuno provato sulla macchina | senza console un panic va attribuito a un pezzo solo. |
+| **P5-1. Sotto-passi** | **5a** assembly, ciclo, uscite HLT/I/O/EPT violation, interrupt e NMI; **5b** uscite MMIO e protocollo EPT sotto carico; **5c** CPUID con maschere, MSR, CR, XSETBV; **5d** FPU, registri di debug, TSC; **5e** segnali, `comm->stop`, prelazione. Ognuno provato sulla macchina | senza console un panic va attribuito a un pezzo solo. L'uscita EPT violation è passata dal 5b al 5a: con memoria paginabile ogni primo accesso a una pagina la produce, il guest non legge nemmeno la prima istruzione senza. |
 | **P5-2. FPU** | **come NetBSD**: `fpu_kern_enter(FPU_KERN_NOCTX)` e XRSTOR/XSAVE dello stato guest intorno a ogni ingresso | semplice, e lo stato FPU dei processi host non è mai esposto al guest; l'ottimizzazione pigra alla bhyve si valuta dopo. |
 | **P5-3. Criterio di fine fase** | **micro-guest in `nvmmtest`**; l'avvio di Linux passa alla fase 7 con QEMU | senza libnvmm e QEMU servirebbe un loader usa e getta. |
 
