@@ -850,7 +850,17 @@ struct vmx_cpudata {
 	uint64_t gxcr0;
 	uint64_t gprs[NVMM_X64_NGPR];
 	uint64_t drs[NVMM_X64_NDR];
-	uint64_t gtsc;
+	/*
+	 * FreeBSD, as DragonFly: the guest TSC is the host TSC plus a fixed
+	 * offset, changed only when the TSC is written. NetBSD saves the
+	 * guest TSC at each exit and recomputes the offset whenever the vCPU
+	 * lands on another host CPU, which loses the time spent outside the
+	 * guest; FreeBSD migrates threads often, and Linux guests saw their
+	 * TSC run ~17% slow and 0.8 s apart between vCPUs. Assumes the host
+	 * TSCs are synchronized (invariant TSC).
+	 */
+	uint64_t gtsc_offset;
+	uint64_t gtsc_last;	/* last TSC getstate reported */
 
 	/* VCPU configuration. */
 	bool cpuidpresent[VMX_NCPUIDS];
@@ -2265,7 +2275,7 @@ vmx_inkernel_handle_msr(struct nvmm_machine *mach __unused, struct nvmm_cpu *vcp
 		}
 	} else {
 		if (exit->u.wrmsr.msr == MSR_TSC) {
-			cpudata->gtsc = exit->u.wrmsr.val;
+			cpudata->gtsc_offset = exit->u.wrmsr.val - rdtsc();
 			cpudata->gtsc_want_update = true;
 			goto handled;
 		}
@@ -2619,8 +2629,15 @@ vmx_vcpu_setstate(struct nvmm_cpu *vcpu)
 		vmx_vmwrite(VMCS_GUEST_IA32_SYSENTER_EIP,
 		    state->msrs[NVMM_X64_MSR_SYSENTER_EIP]);
 
-		cpudata->gtsc = state->msrs[NVMM_X64_MSR_TSC];
-		cpudata->gtsc_want_update = true;
+		/*
+		 * Writing back the TSC getstate reported is not a TSC write
+		 * (QEMU does it with the rest of the MSRs): keep the offset.
+		 */
+		if (state->msrs[NVMM_X64_MSR_TSC] != cpudata->gtsc_last) {
+			cpudata->gtsc_offset =
+			    state->msrs[NVMM_X64_MSR_TSC] - rdtsc();
+			cpudata->gtsc_want_update = true;
+		}
 
 		/* ENTRY_CTLS_LONG_MODE must match EFER_LMA. */
 		ctls1 = vmx_vmread(VMCS_ENTRY_CTLS);
@@ -2754,7 +2771,8 @@ vmx_vcpu_getstate(struct nvmm_cpu *vcpu)
 		    vmx_vmread(VMCS_GUEST_IA32_SYSENTER_ESP);
 		state->msrs[NVMM_X64_MSR_SYSENTER_EIP] =
 		    vmx_vmread(VMCS_GUEST_IA32_SYSENTER_EIP);
-		state->msrs[NVMM_X64_MSR_TSC] = cpudata->gtsc;
+		state->msrs[NVMM_X64_MSR_TSC] = rdtsc() + cpudata->gtsc_offset;
+		cpudata->gtsc_last = state->msrs[NVMM_X64_MSR_TSC];
 	}
 
 	if (flags & NVMM_X64_STATE_INTR) {
@@ -4007,7 +4025,7 @@ vmx_vcpu_run(struct nvmm_machine *mach, struct nvmm_cpu *vcpu,
 		}
 
 		if (__predict_false(cpudata->gtsc_want_update)) {
-			vmx_vmwrite(VMCS_TSC_OFFSET, cpudata->gtsc - rdtsc());
+			vmx_vmwrite(VMCS_TSC_OFFSET, cpudata->gtsc_offset);
 			cpudata->gtsc_want_update = false;
 		}
 
@@ -4131,8 +4149,6 @@ vmx_vcpu_run(struct nvmm_machine *mach, struct nvmm_cpu *vcpu,
 	}
 
 	cpudata->vmcs_launched = launched;
-
-	cpudata->gtsc = vmx_vmread(VMCS_TSC_OFFSET) + rdtsc();
 
 	vmx_vcpu_guest_misc_leave(vcpu);
 	vmx_vcpu_guest_dbregs_leave(vcpu);
