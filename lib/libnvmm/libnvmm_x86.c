@@ -38,14 +38,21 @@
 #include <errno.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#if defined(__FreeBSD__)
+#include "nvmm_compat.h"
+#undef MIN
+#else
 #include <machine/vmparam.h>
 #include <machine/pte.h>
 #include <machine/psl.h>
+#endif
 
 #define MIN(X, Y) (((X) < (Y)) ? (X) : (Y))
 #define __cacheline_aligned __attribute__((__aligned__(64)))
 
+#if !defined(__FreeBSD__)
 #include <x86/specialreg.h>
+#endif
 
 /* -------------------------------------------------------------------------- */
 

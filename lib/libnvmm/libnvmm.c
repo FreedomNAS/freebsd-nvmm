@@ -39,7 +39,11 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/queue.h>
+#if defined(__FreeBSD__)
+#include "nvmm_compat.h"
+#else
 #include <machine/vmparam.h>
+#endif
 
 #include "nvmm.h"
 
