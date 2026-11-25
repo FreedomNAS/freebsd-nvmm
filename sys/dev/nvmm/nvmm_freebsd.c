@@ -39,6 +39,7 @@
 #include <sys/systm.h>
 #include <sys/kernel.h>
 #include <sys/conf.h>
+#include <sys/eventhandler.h>
 #include <sys/fcntl.h>
 #include <sys/malloc.h>
 #include <sys/mman.h>
@@ -286,6 +287,34 @@ static struct cdev *nvmm_dev;
  */
 static bool nvmm_loaded;
 
+/*
+ * Suspend/resume (decision F2-3 in PORTING.md). NetBSD hooks nvmm_suspend()
+ * and nvmm_resume() to pmf; on FreeBSD the power_suspend/power_resume events
+ * run in thread context around an ACPI sleep, before the CPUs save their
+ * context and after they are all back. vmm_resume_p is not used: mp_x86.c
+ * calls it on the APs only, never on CPU 0.
+ */
+static eventhandler_tag nvmm_suspend_tag;
+static eventhandler_tag nvmm_resume_tag;
+static bool nvmm_pm_suspended;
+
+static void
+nvmm_power_suspend(void *arg __unused)
+{
+	nvmm_suspend();
+	nvmm_pm_suspended = true;
+}
+
+static void
+nvmm_power_resume(void *arg __unused)
+{
+	/* A resume event can come without a suspend (aborted sleep). */
+	if (!nvmm_pm_suspended)
+		return;
+	nvmm_pm_suspended = false;
+	nvmm_resume();
+}
+
 static void
 nvmm_dev_dtor(void *arg)
 {
@@ -428,6 +457,11 @@ nvmm_load(void)
 		return error;
 	}
 
+	nvmm_suspend_tag = EVENTHANDLER_REGISTER(power_suspend,
+	    nvmm_power_suspend, NULL, EVENTHANDLER_PRI_ANY);
+	nvmm_resume_tag = EVENTHANDLER_REGISTER(power_resume,
+	    nvmm_power_resume, NULL, EVENTHANDLER_PRI_ANY);
+
 	nvmm_loaded = true;
 	os_printf("nvmm: attached, using backend %s\n", nvmm_impl->name);
 	return 0;
@@ -440,6 +474,9 @@ nvmm_unload(void)
 		return 0;
 	if (os_atomic_load_uint(&nmachines) > 0)
 		return EBUSY;
+
+	EVENTHANDLER_DEREGISTER(power_resume, nvmm_resume_tag);
+	EVENTHANDLER_DEREGISTER(power_suspend, nvmm_suspend_tag);
 
 	if (nvmm_dev != NULL) {
 		/* Waits for running methods and runs the cdevpriv dtors. */
