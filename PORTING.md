@@ -339,6 +339,13 @@ Seguono bhyve senza scelte: protocollo EPT (`pm_active`, SMR, `pm_eptgen`,
 INVEPT), ripristino di GDTR/IDTR (limiti) e LDTR dopo ogni uscita, NMI
 dell'host rilanciati con `int $2`.
 
+### Decisioni della fase 6 (2026-11-25)
+
+| | Decisione | Note |
+|---|---|---|
+| **P6-1. Dove si installa** | **percorsi del sistema base**: `/usr/lib/libnvmm.so.0`, `/usr/include/nvmm.h` e `/usr/include/dev/nvmm/`, `/usr/sbin/nvmmctl`, man in `/usr/share/man` | nvmm prende il posto di vmm nel sistema; con pkgbase i file arrivano come pacchetto, quindi non si mescolano con quelli di FreeBSD senza controllo. |
+| **P6-2. Test di NetBSD** | **programmi da lanciare direttamente** (`h_io_assist`, `h_mem_assist`), senza ATF/kyua | come NetBSD li usa dentro gli script: codice d'uscita 0 = OK. |
+
 Il resto di `vmx_init` NetBSD (bitmap VPID, tipo di INVEPT/INVVPID, tipo
 EPTP, L1TF, leaf CPUID massimi) arriva con la fase 3, dove viene usato. Il
 vettore IPI per i kick delle vCPU arriva con la fase 5.
