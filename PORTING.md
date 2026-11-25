@@ -327,6 +327,18 @@ macchina di test (Haswell, bit A/D presenti) l'emulazione non viene
 esercitata. Il protocollo di invalidazione (`pm_active`, `pm_eptgen`, SMR)
 serve solo con un guest in esecuzione: fase 5.
 
+### Decisioni della fase 5 (2026-11-25)
+
+| | Decisione | Note |
+|---|---|---|
+| **P5-1. Sotto-passi** | **5a** assembly, ciclo, uscite HLT/I/O, interrupt e NMI; **5b** uscite di memoria e protocollo EPT; **5c** CPUID con maschere, MSR, CR, XSETBV; **5d** FPU, registri di debug, TSC; **5e** segnali, `comm->stop`, prelazione. Ognuno provato sulla macchina | senza console un panic va attribuito a un pezzo solo. |
+| **P5-2. FPU** | **come NetBSD**: `fpu_kern_enter(FPU_KERN_NOCTX)` e XRSTOR/XSAVE dello stato guest intorno a ogni ingresso | semplice, e lo stato FPU dei processi host non è mai esposto al guest; l'ottimizzazione pigra alla bhyve si valuta dopo. |
+| **P5-3. Criterio di fine fase** | **micro-guest in `nvmmtest`**; l'avvio di Linux passa alla fase 7 con QEMU | senza libnvmm e QEMU servirebbe un loader usa e getta. |
+
+Seguono bhyve senza scelte: protocollo EPT (`pm_active`, SMR, `pm_eptgen`,
+INVEPT), ripristino di GDTR/IDTR (limiti) e LDTR dopo ogni uscita, NMI
+dell'host rilanciati con `int $2`.
+
 Il resto di `vmx_init` NetBSD (bitmap VPID, tipo di INVEPT/INVVPID, tipo
 EPTP, L1TF, leaf CPUID massimi) arriva con la fase 3, dove viene usato. Il
 vettore IPI per i kick delle vCPU arriva con la fase 5.
