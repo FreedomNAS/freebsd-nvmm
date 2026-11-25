@@ -561,3 +561,16 @@ Commit `68921a2`, `28434a5`, `f0fb381`. OK sulla macchina di test:
 | RDMSR 0x1B (APIC base): uscita RDMSR, risposta di userland | ok |
 | RDMSR PAT nel kernel: valore di reset del guest | ok |
 | scrittura di CR0 (CD/NW tolti) gestita nel kernel | ok |
+
+### 5d: FPU, registri di debug, TSC (2026-11-25)
+
+Nessun cambio nel kernel (la commutazione era già nel ciclo del 5a); prove
+`9215dca`, `423e5f8` (il primo giro è andato in segfault in userland: la
+mia asm del test teneva un puntatore in R10, che la syscall di FreeBSD può
+cambiare). OK sulla macchina di test:
+
+| Prova | Risultato |
+|---|---|
+| host con XMM0/YMM1 (AVX) caricati intorno a 1000 `VCPU_RUN` mentre il guest usa XMM0 | ok: registri host intatti in tutti i giri |
+| XMM0 del guest dopo 1000 uscite con l'host che usa SSE/AVX | ok: valore del guest conservato |
+| TSC del guest impostato a 1000 da userland | ok: ~11 milioni di cicli dopo ~3,6 ms di esecuzione |
