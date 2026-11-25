@@ -344,7 +344,7 @@ dell'host rilanciati con `int $2`.
 | | Decisione | Note |
 |---|---|---|
 | **P6-1. Dove si installa** | **percorsi del sistema base**: `/usr/lib/libnvmm.so.0`, `/usr/include/nvmm.h` e `/usr/include/dev/nvmm/`, `/usr/sbin/nvmmctl`, man in `/usr/share/man` | nvmm prende il posto di vmm nel sistema; con pkgbase i file arrivano come pacchetto, quindi non si mescolano con quelli di FreeBSD senza controllo. |
-| **P6-2. Test di NetBSD** | **programmi da lanciare direttamente** (`h_io_assist`, `h_mem_assist`), senza ATF/kyua | come NetBSD li usa dentro gli script: codice d'uscita 0 = OK. |
+| **P6-2. Test di NetBSD** | **test ATF lanciati con `kyua`** (nel sistema base di FreeBSD): gli script `t_io_assist`/`t_mem_assist` di NetBSD con i loro programmi, installati in `/usr/tests/lib/libnvmm` | struttura di NetBSD conservata, risultato leggibile con `kyua report`; i programmi restano lanciabili anche a mano. |
 
 Il resto di `vmx_init` NetBSD (bitmap VPID, tipo di INVEPT/INVVPID, tipo
 EPTP, L1TF, leaf CPUID massimi) arriva con la fase 3, dove viene usato. Il
