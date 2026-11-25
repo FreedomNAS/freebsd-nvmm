@@ -1652,6 +1652,35 @@ vmx_exit_io(struct nvmm_machine *mach __unused, struct nvmm_cpu *vcpu,
 	    NVMM_X64_STATE_CRS | NVMM_X64_STATE_MSRS);
 }
 
+#define VMX_EPT_VIOLATION_READ		__BIT(0)
+#define VMX_EPT_VIOLATION_WRITE		__BIT(1)
+#define VMX_EPT_VIOLATION_EXECUTE	__BIT(2)
+
+static void
+vmx_exit_epf(struct nvmm_machine *mach __unused, struct nvmm_cpu *vcpu,
+    struct nvmm_vcpu_exit *exit)
+{
+	uint64_t perm;
+	gpaddr_t gpa;
+
+	gpa = vmx_vmread(VMCS_GUEST_PHYSICAL_ADDRESS);
+
+	exit->reason = NVMM_VCPU_EXIT_MEMORY;
+	perm = vmx_vmread(VMCS_EXIT_QUALIFICATION);
+	if (perm & VMX_EPT_VIOLATION_WRITE)
+		exit->u.mem.prot = PROT_WRITE;
+	else if (perm & VMX_EPT_VIOLATION_EXECUTE)
+		exit->u.mem.prot = PROT_EXEC;
+	else
+		exit->u.mem.prot = PROT_READ;
+	exit->u.mem.gpa = gpa;
+	exit->u.mem.inst_len = 0;
+
+	vmx_vcpu_state_provide(vcpu,
+	    NVMM_X64_STATE_GPRS | NVMM_X64_STATE_SEGS |
+	    NVMM_X64_STATE_CRS | NVMM_X64_STATE_MSRS);
+}
+
 
 /* -------------------------------------------------------------------------- */
 
@@ -3320,8 +3349,10 @@ vmx_vcpu_run(struct nvmm_machine *mach, struct nvmm_cpu *vcpu,
 
 		/*
 		 * Phase 5a: the exits below are handled; CPUID, CR, MSRs,
-		 * XSETBV, MONITOR/MWAIT (5c) and EPT violations (5b)
-		 * still come back to userland as invalid exits.
+		 * XSETBV and MONITOR/MWAIT (5c) still come back to
+		 * userland as invalid exits. EPT violations are part of
+		 * 5a: with pageable guest memory every first access to a
+		 * page is one, resolved by the frontend's fault.
 		 */
 		switch (exitcode) {
 		case VMCS_EXITCODE_EXC_NMI:
@@ -3335,6 +3366,9 @@ vmx_vcpu_run(struct nvmm_machine *mach, struct nvmm_cpu *vcpu,
 			break;
 		case VMCS_EXITCODE_IO:
 			vmx_exit_io(mach, vcpu, exit);
+			break;
+		case VMCS_EXITCODE_EPT_VIOLATION:
+			vmx_exit_epf(mach, vcpu, exit);
 			break;
 		case VMCS_EXITCODE_SHUTDOWN:
 			exit->reason = NVMM_VCPU_EXIT_SHUTDOWN;
