@@ -2699,8 +2699,20 @@ vmx_vcpu_setstate(struct nvmm_cpu *vcpu)
 		fpustate->fx_mxcsr &= fpustate->fx_mxcsr_mask;
 
 		if (cpudata->xcr0_mask != 0) {
-			/* Reset XSTATE_BV, to force a reload. */
-			cpudata->gfpu.xsh_xstate_bv = cpudata->xcr0_mask;
+			/*
+			 * The x87 and SSE components were just provided:
+			 * mark them valid so that XRSTOR loads them. Only
+			 * them. NetBSD sets XSTATE_BV to the whole mask, which
+			 * also marks valid the extended components (AVX
+			 * upper halves...) that the last XSAVE did not write
+			 * because they were in their initial state: XRSTOR
+			 * then loaded stale memory into the guest's YMM
+			 * registers instead of zeros, and Linux guests under
+			 * QEMU got corrupted data (failed module loads, apk
+			 * integrity errors; fine with "noxsave").
+			 */
+			cpudata->gfpu.xsh_xstate_bv |=
+			    (XCR0_X87 | XCR0_SSE) & cpudata->xcr0_mask;
 		}
 	}
 	/*
@@ -2807,6 +2819,31 @@ vmx_vcpu_getstate(struct nvmm_cpu *vcpu)
 	if (flags & NVMM_X64_STATE_FPU) {
 		memcpy(&state->fpu, cpudata->gfpu.xsh_fxsave,
 		    sizeof(state->fpu));
+
+		/*
+		 * A component XSAVE found in its initial state is not
+		 * written: its part of the legacy area is stale and
+		 * XSTATE_BV says so. Report the initial values instead, or
+		 * userland would write the stale ones back with setstate.
+		 */
+		if (cpudata->xcr0_mask != 0) {
+			uint64_t bv = cpudata->gfpu.xsh_xstate_bv;
+
+			if ((bv & XCR0_X87) == 0) {
+				state->fpu.fx_cw = 0x037F;
+				state->fpu.fx_sw = 0;
+				state->fpu.fx_tw = 0;
+				state->fpu.fx_opcode = 0;
+				state->fpu.fx_ip.fa_64 = 0;
+				state->fpu.fx_dp.fa_64 = 0;
+				memset(state->fpu.fx_87_ac, 0,
+				    sizeof(state->fpu.fx_87_ac));
+			}
+			if ((bv & XCR0_SSE) == 0) {
+				memset(state->fpu.fx_xmm, 0,
+				    sizeof(state->fpu.fx_xmm));
+			}
+		}
 	}
 	/*
 	 * XXX XSAVE area -- need to allocate and map it separately
