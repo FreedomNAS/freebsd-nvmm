@@ -574,3 +574,21 @@ cambiare). OK sulla macchina di test:
 | host con XMM0/YMM1 (AVX) caricati intorno a 1000 `VCPU_RUN` mentre il guest usa XMM0 | ok: registri host intatti in tutti i giri |
 | XMM0 del guest dopo 1000 uscite con l'host che usa SSE/AVX | ok: valore del guest conservato |
 | TSC del guest impostato a 1000 da userland | ok: ~11 milioni di cicli dopo ~3,6 ms di esecuzione |
+
+### 5e: segnali, `comm->stop`, prelazione (2026-11-25)
+
+Nessun cambio nel kernel; prova `a3305a0`. Guest in ciclo infinito
+(`jmp $`), OK sulla macchina di test:
+
+| Prova | Risultato |
+|---|---|
+| `SIGUSR1` al thread della vCPU | ok: in userland dopo 0,1 ms |
+| `comm->stop` | ok: uscita STOPPED dopo 0,6–0,7 ms, flag azzerato dal kernel |
+| 8 vCPU in ciclo infinito su 4 CPU per 2 s | ok: ognuna torna in userland ≥ 20 volte; un thread host con `usleep(10 ms)` ritardato al massimo 5–39 ms |
+| `SIGKILL` a un processo con una vCPU in ciclo infinito | ok: morto in 0,15 ms, tutto liberato |
+
+**Fase 5 chiusa.** `vcpu_run` completo sull'i5-4440: entry/exit,
+HLT/I/O/EPT/MMIO, interrupt iniettati e NMI, CPUID con maschere, MSR, CR,
+XSETBV, FPU isolata dall'host, TSC del guest, invalidazioni EPT con la
+vCPU in esecuzione, segnali, stop, prelazione, kill. L'avvio di un kernel
+Linux si fa nella fase 7 con QEMU (decisione P5-3).
