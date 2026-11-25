@@ -232,6 +232,13 @@ const struct nvmm_x64_state nvmm_x86_reset_state = {
 		.fx_tw = 0x55,
 		.fx_zero = 0x55,
 		.fx_mxcsr = 0x1F80,
+		/*
+		 * FreeBSD: setstate ANDs fx_mxcsr with fx_mxcsr_mask, which
+		 * NetBSD leaves at 0 here, turning the RESET MXCSR into 0
+		 * instead of 0x1F80. All ones: setstate clips it to the
+		 * host's mask.
+		 */
+		.fx_mxcsr_mask = 0xFFFFFFFF,
 	}
 };
 
