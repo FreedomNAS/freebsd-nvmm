@@ -315,6 +315,18 @@ IPI per le invalidazioni EPT allocato al caricamento con `lapic_ipi_alloc`
 alla creazione), ioctl aperti solo per macchine e vCPU (memoria e
 `vcpu_run` restano `ENOSYS`).
 
+### Decisioni della fase 4 (2026-11-25)
+
+| | Decisione | Note |
+|---|---|---|
+| **P4-1. Provare la memoria prima che un guest giri** | **ioctl di debug solo nella build di prova** (`make -DNVMM_DEBUG`): dato un gpa, fault attraverso il pmap EPT e lettura/scrittura della pagina fisica che il guest vedrebbe | la parte più rischiosa (fault e mappature EPT) provata da sola, prima di mescolarla con `vcpu_run`. Il modulo normale non ha l'ioctl. |
+
+Fault come bhyve: `pmap_emulate_accessed_dirty()` (solo CPU senza bit A/D
+dell'EPT, es. Ivy Bridge) e poi `vm_fault()` sul vmspace EPT. Sulla
+macchina di test (Haswell, bit A/D presenti) l'emulazione non viene
+esercitata. Il protocollo di invalidazione (`pm_active`, `pm_eptgen`, SMR)
+serve solo con un guest in esecuzione: fase 5.
+
 Il resto di `vmx_init` NetBSD (bitmap VPID, tipo di INVEPT/INVVPID, tipo
 EPTP, L1TF, leaf CPUID massimi) arriva con la fase 3, dove viene usato. Il
 vettore IPI per i kick delle vCPU arriva con la fase 5.
