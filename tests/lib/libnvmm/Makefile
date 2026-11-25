@@ -18,4 +18,8 @@ CFLAGS+=	-Wall
 LDFLAGS+=	-L${.OBJDIR}/../../../lib/libnvmm
 LDADD+=		-lnvmm
 
+# Not in the base mtree: create the test directory.
+beforeinstall:
+	${INSTALL} -d ${DESTDIR}${TESTSDIR}
+
 .include <bsd.test.mk>

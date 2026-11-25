@@ -24,4 +24,8 @@ CFLAGS+=	-I${.CURDIR}/../../sys
 # ignore arguments and reads operands through byte pointers on x86.
 WARNS?=		3
 
+# Not in the base mtree: create the header directories.
+beforeinstall:
+	${INSTALL} -d ${DESTDIR}${DEVNVMMX86DIR}
+
 .include <bsd.lib.mk>
