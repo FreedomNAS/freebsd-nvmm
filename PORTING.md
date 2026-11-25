@@ -401,3 +401,23 @@ build pulita (`-Werror`) di `nvmm.ko` e `nvmmcap` sulla macchina.
 
 Nessun panic. Il messaggio "failed to load CTF for nvmm.ko" è solo
 informativo (modulo senza sezione CTF per DTrace). Fase 1 chiusa.
+
+## 9. Fase 2: VMXON per CPU (2026-11-25)
+
+Fatto (commit `8f542fc`, `70349a8`): regioni VMXON per CPU, lock di
+`IA32_FEATURE_CONTROL` se libero, `CR4.VMXE` + VMXON in `smp_rendezvous`
+con esito per CPU; rifiuto pulito se `CR4.VMXE` è già acceso (F2-2) o se
+VMXON fallisce su una CPU, con rollback sulle altre (F2-1); VMXOFF allo
+scarico; sospensione/ripresa via `power_suspend`/`power_resume` (F2-3).
+
+Sulla macchina di test (i5-4440, 4 CPU):
+
+| Prova | Risultato |
+|---|---|
+| `kldload` (bootverbose) | ok: "VMXON on 4 CPUs", "attached, using backend x86-vmx" |
+| `kldload vmm` con nvmm caricato | rifiutato |
+| 100 cicli `kldload`/`kldunload` | 100/100, nessun messaggio d'errore. Ogni caricamento ricontrolla `CR4.VMXE` su tutte le CPU, quindi ogni giro verifica anche che lo scarico precedente abbia fatto VMXOFF ovunque |
+| a fine prova | nessun modulo caricato |
+
+Non provato: sospensione S3 (macchina senza schermo) e i rami d'errore
+(VMXE occupato, VMXON fallito), che su questo hardware non si presentano.
