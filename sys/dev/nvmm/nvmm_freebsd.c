@@ -589,6 +589,13 @@ nvmm_vmm_present(void)
 	return present;
 }
 
+/*
+ * /dev/nvmm is root:nvmm 0660. The kernel cannot look a group up by name,
+ * so the nvmm group has a fixed GID, free in the ports' GIDs registry; the
+ * package creates the group with this number.
+ */
+#define NVMM_GID	402
+
 static int
 nvmm_load(void)
 {
@@ -617,8 +624,8 @@ nvmm_load(void)
 	args.mda_flags = MAKEDEV_CHECKNAME | MAKEDEV_WAITOK;
 	args.mda_devsw = &nvmm_cdevsw;
 	args.mda_uid = UID_ROOT;
-	args.mda_gid = GID_WHEEL;
-	args.mda_mode = 0600;
+	args.mda_gid = NVMM_GID;
+	args.mda_mode = 0660;
 	error = make_dev_s(&args, &nvmm_dev, "nvmm");
 	if (error) {
 		os_printf("nvmm: unable to create /dev/nvmm (error %d)\n",

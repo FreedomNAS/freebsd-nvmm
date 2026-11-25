@@ -288,7 +288,7 @@ correzioni NetBSD↔DragonFly, sysctl/statistiche, pacchetto FreeBSD.
 | **D1. ABI verso userland** | **NetBSD**: kernel v2, libnvmm v2, `comm->stop` / `nvmm_vcpu_stop()`, `NVMM_VCPU_CONF_XCR0_MASK` | più completa; QEMU la usa già com'è. Più lavoro: base NetBSD convertita alle `os_*` (vedi §2) e comm page via `d_mmap_single`. |
 | **D2. Memoria guest** | **paginabile** (`OBJT_SWAP`, fault su EPT violation) | la cablata si aggiunge dopo, quando la paginabile è stabile: una cosa alla volta, per sapere da dove arrivano i problemi. |
 | **D3. vmm.ko caricato dopo nvmm.ko** | nvmm.ko dichiara anche **`MODULE_VERSION(vmm, 1)`** | il linker rifiuta vmm.ko prima di eseguirne il codice; più il controllo al caricamento di nvmm.ko se vmm è già presente. |
-| Permessi di `/dev/nvmm` | `root:wheel 0600` nella fase 1 | il gruppo dedicato si decide con il modulo VM di FreedomNAS. |
+| Permessi di `/dev/nvmm` | `root:nvmm 0660`, GID fisso 402 (deciso 2026-11-25) | il kernel non risolve i nomi dei gruppi: il pacchetto crea `nvmm` con lo stesso GID, libero nel registro GIDs dei port. |
 | Repo | `~/git-projects/freedomnas/freebsd-nvmm`, commit locali | nessun remoto finché non lo crei tu. |
 | Copyright dei file nuovi | `Sarah Chiandotto` | confermato 2026-11-25. |
 
