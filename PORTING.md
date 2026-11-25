@@ -547,3 +547,17 @@ Nessun cambio nel kernel; prova `b90a290`. OK sulla macchina di test:
 |---|---|
 | scrittura a gpa non mappato 0x5000 → uscita MEMORY, `prot` WRITE, RIP sull'istruzione | ok |
 | guest che legge in un ciclo stretto gpa 0x3000 mentre un altro thread la rimappa 1000 volte su pagine con contenuti diversi | ok: ogni valore nuovo visto dal guest (circa 1 ms a giro, è il passo di attesa del test), nessuna traduzione EPT rimasta vecchia |
+
+### 5c: CPUID, MSR, CR, XSETBV, MONITOR/MWAIT (2026-11-25)
+
+Commit `68921a2`, `28434a5`, `f0fb381`. OK sulla macchina di test:
+
+| Prova | Risultato |
+|---|---|
+| CPUID 0: vendor dell'host, foglia massima limitata | ok (`GenuineIntel`, 0xD) |
+| CPUID 0x40000000: firma `___ NVMM ___` | ok |
+| CPUID 1: VMX nascosto, bit hypervisor acceso, APIC ID = vCPU | ok |
+| CPUID 6 configurata con `exit`: uscita CPUID, risposta di userland | ok |
+| RDMSR 0x1B (APIC base): uscita RDMSR, risposta di userland | ok |
+| RDMSR PAT nel kernel: valore di reset del guest | ok |
+| scrittura di CR0 (CD/NW tolti) gestita nel kernel | ok |
