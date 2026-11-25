@@ -85,6 +85,13 @@ static SYSCTL_NODE(_hw, OID_AUTO, nvmm, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
 SYSCTL_ULONG(_hw_nvmm, OID_AUTO, kpages, CTLFLAG_RD,
     __DEVOLATILE(u_long *, &nvmm_stat_kpages), 0,
     "Kernel pages allocated by nvmm (VMCS, bitmaps, VMXON regions)");
+#ifdef NVMM_DEBUG
+static int nvmm_debug_build = 1;
+#else
+static int nvmm_debug_build = 0;
+#endif
+SYSCTL_INT(_hw_nvmm, OID_AUTO, debug, CTLFLAG_RD, &nvmm_debug_build, 0,
+    "Test build with NVMM_IOC_DEBUG_GPA (make -DNVMM_DEBUG)");
 SYSCTL_ULONG(_hw_nvmm, OID_AUTO, vmobjs, CTLFLAG_RD,
     __DEVOLATILE(u_long *, &nvmm_stat_vmobjs), 0,
     "VM object references held by nvmm (comm pages, guest memory)");
@@ -215,6 +222,41 @@ os_vmspace_fault(os_vmspace_t *vm, vaddr_t va, vm_prot_t prot)
 	    NULL);
 	return rv == KERN_SUCCESS ? 0 : EFAULT;
 }
+
+#ifdef NVMM_DEBUG
+/*
+ * Test-only (NVMM_IOC_DEBUG_GPA): fault the page in as an EPT violation
+ * would, then take the physical page the EPT pmap maps at gpa, hold it
+ * while copying through the direct map, and release it.
+ */
+int
+os_vmspace_debug_access(os_vmspace_t *vm, gpaddr_t gpa, bool write,
+    void *ubuf)
+{
+	vm_page_t m;
+	void *kva;
+	int error;
+
+	error = os_vmspace_fault(vm, gpa, write ? PROT_WRITE : PROT_READ);
+	if (error)
+		return error;
+
+	m = pmap_extract_and_hold(vmspace_pmap(vm), gpa,
+	    write ? VM_PROT_WRITE : VM_PROT_READ);
+	if (m == NULL)
+		return EFAULT;
+
+	kva = (void *)PHYS_TO_DMAP(VM_PAGE_TO_PHYS(m));
+	if (write) {
+		error = copyin(ubuf, kva, PAGE_SIZE);
+		vm_page_dirty(m);
+	} else {
+		error = copyout(kva, ubuf, PAGE_SIZE);
+	}
+	vm_page_unwire(m, PQ_ACTIVE);
+	return error;
+}
+#endif
 
 os_vmobj_t *
 os_vmobj_create(voff_t size)

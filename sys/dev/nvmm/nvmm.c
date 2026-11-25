@@ -46,6 +46,9 @@
 #include <dev/nvmm/nvmm_os.h>
 #include <dev/nvmm/nvmm_internal.h>
 #include <dev/nvmm/nvmm_ioctl.h>
+#ifdef NVMM_DEBUG
+#include <dev/nvmm/nvmm_debug.h>
+#endif
 
 static struct nvmm_machine machines[NVMM_MAX_MACHINES];
 volatile unsigned int nmachines __cacheline_aligned;
@@ -1188,23 +1191,43 @@ nvmm_comm_object(struct nvmm_owner *owner, uint64_t off, size_t size,
 }
 
 /*
- * FreeBSD port, phase 3: machines and vCPUs are wired up. Guest memory
- * (phase 4) and vcpu_run (phase 5) answer ENOSYS until they are ported.
+ * FreeBSD port, phase 4: machines, vCPUs and guest memory are wired up.
+ * vcpu_run (phase 5) answers ENOSYS until it is ported.
  */
 static bool
 nvmm_ioctl_ported(unsigned long cmd)
 {
-	switch (cmd) {
-	case NVMM_IOC_VCPU_RUN:
-	case NVMM_IOC_GPA_MAP:
-	case NVMM_IOC_GPA_UNMAP:
-	case NVMM_IOC_HVA_MAP:
-	case NVMM_IOC_HVA_UNMAP:
-		return false;
-	default:
-		return true;
-	}
+	return cmd != NVMM_IOC_VCPU_RUN;
 }
+
+#ifdef NVMM_DEBUG
+/*
+ * Test-only request (nvmm_debug.h): one page of guest physical memory, as
+ * the guest would reach it through the EPT.
+ */
+static int
+nvmm_debug_gpa(struct nvmm_owner *owner, struct nvmm_ioc_debug_gpa *args)
+{
+	struct nvmm_machine *mach;
+	int error;
+
+	error = nvmm_machine_get(owner, args->machid, &mach, false);
+	if (error)
+		return error;
+
+	if ((args->gpa % PAGE_SIZE) != 0 || args->gpa < mach->gpa_begin ||
+	    args->gpa >= mach->gpa_end) {
+		error = EINVAL;
+		goto out;
+	}
+	error = os_vmspace_debug_access(mach->vm, args->gpa,
+	    args->write != 0, args->buf);
+
+out:
+	nvmm_machine_put(mach);
+	return error;
+}
+#endif
 
 static int
 nvmm_ioctl_internal(struct nvmm_owner *owner, unsigned long cmd, void *data)
@@ -1247,6 +1270,10 @@ nvmm_ioctl_internal(struct nvmm_owner *owner, unsigned long cmd, void *data)
 		return nvmm_hva_unmap(owner, data);
 	case NVMM_IOC_CTL:
 		return nvmm_ctl(owner, data);
+#ifdef NVMM_DEBUG
+	case NVMM_IOC_DEBUG_GPA:
+		return nvmm_debug_gpa(owner, data);
+#endif
 	default:
 		return EINVAL;
 	}

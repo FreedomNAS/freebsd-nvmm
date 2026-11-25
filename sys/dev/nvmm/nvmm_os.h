@@ -451,6 +451,10 @@ extern int (*os_vmspace_pinit)(pmap_t);
 void		os_vmspace_ept_setup(bool has_ad);
 /* IPI vector that interrupts a CPU running a guest (EPT pmap, kicks). */
 int		os_ipi_vector(void);
+#ifdef NVMM_DEBUG
+/* Test-only: one guest page through the EPT, to or from userland. */
+int		os_vmspace_debug_access(os_vmspace_t *, gpaddr_t, bool, void *);
+#endif
 #endif
 
 static inline bool
