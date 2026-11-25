@@ -599,3 +599,31 @@ HLT/I/O/EPT/MMIO, interrupt iniettati e NMI, CPUID con maschere, MSR, CR,
 XSETBV, FPU isolata dall'host, TSC del guest, invalidazioni EPT con la
 vCPU in esecuzione, segnali, stop, prelazione, kill. L'avvio di un kernel
 Linux si fa nella fase 7 con QEMU (decisione P5-3).
+
+## 13. Fase 6: libnvmm, nvmmctl, test di NetBSD (2026-11-25)
+
+Fatto (commit `1bc965f`…`dd12324`): libnvmm, nvmmctl(8) e i test ATF di
+NetBSD su FreeBSD, installati nei percorsi del sistema base (P6-1) con
+`make && make install` dalla radice del repo.
+
+Differenze da NetBSD trovate provando sulla macchina:
+- libnvmm apre `/dev/nvmm` `O_RDWR`: FreeBSD (`vm_mmap_cdev()`) rifiuta la
+  mappatura condivisa scrivibile delle comm page su un descrittore in sola
+  lettura, NetBSD la permette (`EACCES` da `nvmm_vcpu_create`);
+- `humanize_number()` di FreeBSD non accetta un suffisso `NULL`;
+- FreeBSD non ha `snprintb(3)`: una versione minima in nvmmctl;
+- `install(1)` non crea `/usr/include/dev/nvmm` e `/usr/tests/lib/libnvmm`,
+  che non sono nell'mtree di base: li creano i Makefile;
+- `kyua test`/`report` vogliono lo schema in `/usr/share/kyua/store`, che
+  in pkgbase sta in `FreeBSD-tests` (non installato sulla macchina): i test
+  ATF girano con `kyua debug`, che dà lo stesso esito senza database.
+
+Sulla macchina di test (i5-4440):
+
+| Prova | Risultato |
+|---|---|
+| `nvmmctl identify` | ok: API 2, 128 macchine, 256 vCPU, 128G, conf vCPU `<CPUID,TPR>`, FPU `<x87,SSE,AVX>` |
+| `nvmmctl list` | ok (vuota) |
+| `kyua debug t_io_assist:io_assist` (NetBSD) | **passed**: 12/12 (IN/OUT byte/word/dword, INS/OUTS con REP) |
+| `kyua debug t_mem_assist:mem_assist` (NetBSD) | **passed**: emulatore MMIO 64 e 16 bit (incl. disp16, XCHG) |
+| contatori e `kldunload` | ok |
