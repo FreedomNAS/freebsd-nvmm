@@ -478,3 +478,31 @@ Sulla macchina di test (i5-4440), `nvmmtest` 3 giri di fila, tutti OK:
 | `VCPU_RUN`, `GPA_MAP`, `HVA_MAP` → `ENOSYS` | ok |
 | figlio con 4 macchine × 4 vCPU che esce senza distruggere | ok: nel figlio `kpages 68` (4 VMXON + 16 vCPU × 4 pagine), dopo l'uscita di nuovo 4 |
 | contatori `hw.nvmm.*` dopo ogni passo, `kldunload` finale | tornati ai valori iniziali, scarico pulito |
+
+## 11. Fase 4: memoria guest (2026-11-25)
+
+Fatto (commit `11caaa9`, `6405318`, `86e59a9`): fault come bhyve
+(`pmap_emulate_accessed_dirty()` e poi `vm_fault()` sul vmspace EPT),
+ioctl `hva_map/unmap` e `gpa_map/unmap` aperti (resta `ENOSYS` solo
+`vcpu_run`), ioctl di prova `NVMM_IOC_DEBUG_GPA` solo con
+`make -DNVMM_DEBUG` (`hw.nvmm.debug` = 1), prove di memoria in
+`nvmmtest`.
+
+Sulla macchina di test (i5-4440): build di debug 3 giri, build normale 1
+giro, tutti OK, scarico pulito.
+
+| Prova | Risultato |
+|---|---|
+| errori di `hva_map` (sovrapposizione, non allineato) e `gpa_map` (hva non mappato, oltre `max_ram`, non allineato, prot non valida) | ok |
+| host scrive → guest legge, anche dall'alias in sola lettura | ok |
+| guest scrive → host legge | ok |
+| pagina mai toccata letta dal guest: tutta a zero | ok |
+| scrittura sull'alias in sola lettura e lettura di gpa non mappato → `EFAULT` | ok |
+| dopo `gpa_unmap` la lettura fallisce, l'alias resta valido | ok |
+| `hva_unmap` doppio → `ENOENT` | ok |
+| macchina distrutta con la memoria mappata: l'host la usa fino al `munmap` | ok |
+| figlio che esce con 4 macchine, 16 vCPU e memoria scritta | ok (`vmobjs 8` nel figlio, 0 dopo) |
+| contatori a fine giro, build normale senza l'ioctl di prova | ok |
+
+Non provato: emulazione dei bit A/D (Haswell li ha), invalidazioni EPT con
+una vCPU in esecuzione (fase 5).
