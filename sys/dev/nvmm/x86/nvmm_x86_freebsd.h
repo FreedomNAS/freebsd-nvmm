@@ -55,6 +55,27 @@
 #define XCR0_SSE		XFEATURE_ENABLED_SSE
 #define XCR0_YMM_Hi128		XFEATURE_ENABLED_AVX
 
+/* <x86/specialreg.h>: control register bits. */
+#ifndef CR0_ET
+#define CR0_ET			0x00000010
+#endif
+#define CR4_OSFXSR		CR4_FXSR
+#define CR4_OSXMMEXCPT		CR4_XMM
+#define CR4_OSXSAVE		CR4_XSAVE
+
+/* <x86/specialreg.h>: IA32_MISC_ENABLE bits. */
+#define IA32_MISC_PERFMON_EN	__BIT(7)
+#define IA32_MISC_BTS_UNAVAIL	__BIT(11)
+#define IA32_MISC_PEBS_UNAVAIL	__BIT(12)
+#define IA32_MISC_EISST_EN	__BIT(16)
+#define IA32_MISC_MWAIT_EN	__BIT(18)
+
+/* <x86/specialreg.h>: L1TF mitigation. */
+#define CPUID_SEF_L1D_FLUSH		CPUID_STDEXT3_L1D_FLUSH
+#define CPUID_SEF_ARCH_CAP		CPUID_STDEXT3_ARCH_CAP
+#define MSR_IA32_ARCH_CAPABILITIES	MSR_IA32_ARCH_CAP
+#define IA32_ARCH_SKIP_L1DFL_VMENTRY	IA32_ARCH_CAP_SKIP_L1DFL_VMENTRY
+
 /* <x86/pat.h>: memory types of the PAT entries. */
 #define PAT_UC			0x0ULL
 #define PAT_WC			0x1ULL
