@@ -30,8 +30,8 @@
  * Acceptance test of phases 3 and 4, with raw ioctls (libnvmm is phase
  * 6): machines and vCPUs up to the limits, the reset state, a
  * setstate/getstate round trip, vCPU configuration, event injection, guest
- * memory (host and guest mappings, their errors), vcpu_run still ENOSYS,
- * and processes that exit without destroying anything. After each step the
+ * memory (host and guest mappings, their errors), micro-guests run with
+ * vcpu_run (phase 5), and processes that exit without destroying anything. After each step the
  * hw.nvmm counters must be back to where they started.
  *
  * With a module built with -DNVMM_DEBUG, the memory test also goes through
@@ -39,6 +39,7 @@
  */
 
 #include <sys/types.h>
+#include <sys/cpuset.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/sysctl.h>
@@ -53,6 +54,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <dev/nvmm/nvmm_ioctl.h>
@@ -422,7 +424,7 @@ test_configure_inject(int fd)
 	uint64_t xcr0;
 	int error;
 
-	printf("configure, inject, vcpu_run still ENOSYS\n");
+	printf("configure, inject\n");
 	error = machine_create(fd, &machid);
 	check(error == 0, "machine: %s", strerror(error));
 	if (error)
@@ -475,9 +477,6 @@ test_configure_inject(int fd)
 	check(error == 0 && comm->state.intr.evt_pending,
 	    "event not pending after inject");
 
-	error = vcpu_ioctl(fd, NVMM_IOC_VCPU_RUN, machid, 0);
-	check(error == ENOSYS, "VCPU_RUN: expected ENOSYS, got %s",
-	    error ? strerror(error) : "success");
 
 	munmap(comm, getpagesize());
 out:
@@ -696,6 +695,247 @@ test_memory(int fd)
 	free(want);
 }
 
+/* -------------------------------------------------------------------------- */
+
+/*
+ * Micro-guest in real mode (phase 5a). Guest physical memory: 4 pages at 0.
+ *
+ *   0x0080  IVT entry of vector 0x20 -> 0000:2000
+ *   0x1000  mov ax,0x1234 ; out 0x80,ax ; inc ax ; out 0x80,ax
+ *   0x1008  sti ; hlt ; jmp hlt
+ *   0x2000  mov al,0x55 ; out 0x81,al ; iret      (vector 0x20 handler)
+ */
+static const uint8_t guest_main[] = {
+	0xB8, 0x34, 0x12,	/* 1000: mov ax,0x1234 */
+	0xE7, 0x80,		/* 1003: out 0x80,ax */
+	0x40,			/* 1005: inc ax */
+	0xE7, 0x80,		/* 1006: out 0x80,ax */
+	0xFB,			/* 1008: sti */
+	0xF4,			/* 1009: hlt */
+	0xEB, 0xFD,		/* 100A: jmp 1009 */
+};
+static const uint8_t guest_int20[] = {
+	0xB0, 0x55,		/* 2000: mov al,0x55 */
+	0xE6, 0x81,		/* 2002: out 0x81,al */
+	0xCF,			/* 2004: iret */
+};
+
+static int
+vcpu_run(int fd, nvmm_machid_t machid, nvmm_cpuid_t cpuid,
+    struct nvmm_vcpu_exit *exit)
+{
+	struct nvmm_ioc_vcpu_run args = { .machid = machid, .cpuid = cpuid };
+	int error;
+
+	error = ioctl(fd, NVMM_IOC_VCPU_RUN, &args) == -1 ? errno : 0;
+	*exit = args.exit;
+	return error;
+}
+
+static const char *
+exit_name(uint64_t reason)
+{
+	switch (reason) {
+	case NVMM_VCPU_EXIT_NONE:	return "NONE";
+	case NVMM_VCPU_EXIT_STOPPED:	return "STOPPED";
+	case NVMM_VCPU_EXIT_INVALID:	return "INVALID";
+	case NVMM_VCPU_EXIT_MEMORY:	return "MEMORY";
+	case NVMM_VCPU_EXIT_IO:		return "IO";
+	case NVMM_VCPU_EXIT_SHUTDOWN:	return "SHUTDOWN";
+	case NVMM_VCPU_EXIT_HALTED:	return "HALTED";
+	default:			return "other";
+	}
+}
+
+/* Runs until an exit other than NONE (interrupted by the host). */
+static int
+run_until(int fd, nvmm_machid_t machid, struct nvmm_vcpu_exit *exit)
+{
+	int error, i;
+
+	for (i = 0; i < 1000; i++) {
+		error = vcpu_run(fd, machid, 0, exit);
+		if (error != 0 || exit->reason != NVMM_VCPU_EXIT_NONE)
+			return error;
+	}
+	return ETIMEDOUT;
+}
+
+static bool
+expect_exit(const char *what, int error, const struct nvmm_vcpu_exit *exit,
+    uint64_t reason)
+{
+	check(error == 0, "%s: vcpu_run: %s", what, strerror(error));
+	if (error != 0)
+		return false;
+	check(exit->reason == reason, "%s: exit %s (0x%jx, hwcode %ju), "
+	    "expected %s", what, exit_name(exit->reason),
+	    (uintmax_t)exit->reason, exit->reason == NVMM_VCPU_EXIT_INVALID ?
+	    (uintmax_t)exit->u.inv.hwcode : 0, exit_name(reason));
+	return exit->reason == reason;
+}
+
+/* After an I/O exit: continue after the instruction. */
+static void
+skip_io(struct nvmm_comm_page *comm, const struct nvmm_vcpu_exit *exit)
+{
+	comm->state.gprs[NVMM_X64_GPR_RIP] = exit->u.io.npc;
+	comm->state_commit |= NVMM_X64_STATE_GPRS;
+}
+
+static bool
+pin_to_cpu(int cpu)
+{
+	cpuset_t set;
+
+	CPU_ZERO(&set);
+	if (cpu < 0) {
+		if (cpuset_getaffinity(CPU_LEVEL_ROOT, CPU_WHICH_PID, -1,
+		    sizeof(set), &set) != 0)
+			return false;
+	} else {
+		CPU_SET(cpu, &set);
+	}
+	return cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1,
+	    sizeof(set), &set) == 0;
+}
+
+static void
+test_run(int fd)
+{
+	size_t ps = (size_t)getpagesize(), size = 4 * ps;
+	struct nvmm_vcpu_exit exit;
+	struct nvmm_comm_page *comm;
+	struct nvmm_x64_state *st;
+	struct timespec t0, t1;
+	nvmm_machid_t machid;
+	uint8_t *mem;
+	long ncpu;
+	int error, i, cpu, nhalt;
+	double us;
+
+	printf("run: real-mode micro-guest (out, hlt, injected interrupt)\n");
+	error = machine_create(fd, &machid);
+	check(error == 0, "machine: %s", strerror(error));
+	if (error)
+		return;
+	error = vcpu_create(fd, machid, 0);
+	check(error == 0, "vcpu: %s", strerror(error));
+	if (error)
+		goto out;
+	comm = comm_map(fd, machid, 0);
+	st = &comm->state;
+
+	mem = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE,
+	    -1, 0);
+	if (mem == MAP_FAILED)
+		err(1, "mmap");
+	if (hva_map(fd, machid, mem, size) != 0 ||
+	    gpa_map(fd, machid, mem, 0, size,
+	    PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+		check(false, "guest memory");
+		goto out;
+	}
+	memset(mem, 0, size);
+	mem[0x80] = 0x00; mem[0x81] = 0x20;	/* IVT[0x20] = 0000:2000 */
+	mem[0x82] = 0x00; mem[0x83] = 0x00;
+	memcpy(mem + 0x1000, guest_main, sizeof(guest_main));
+	memcpy(mem + 0x2000, guest_int20, sizeof(guest_int20));
+
+	/* CS:IP = 0000:1000, flat real-mode segments, stack at 0x3FF0. */
+	comm->state_wanted = NVMM_X64_STATE_ALL;
+	comm->state_cached = 0;
+	error = vcpu_ioctl(fd, NVMM_IOC_VCPU_GETSTATE, machid, 0);
+	check(error == 0, "getstate: %s", strerror(error));
+	st->segs[NVMM_X64_SEG_CS].selector = 0;
+	st->segs[NVMM_X64_SEG_CS].base = 0;
+	st->gprs[NVMM_X64_GPR_RIP] = 0x1000;
+	st->gprs[NVMM_X64_GPR_RSP] = 0x3FF0;
+	comm->state_commit = NVMM_X64_STATE_SEGS | NVMM_X64_STATE_GPRS;
+
+	/* out 0x80,ax twice. */
+	error = run_until(fd, machid, &exit);
+	if (expect_exit("first out", error, &exit, NVMM_VCPU_EXIT_IO)) {
+		check(!exit.u.io.in && exit.u.io.port == 0x80 &&
+		    exit.u.io.operand_size == 2, "first out: in %d port 0x%x "
+		    "size %u", exit.u.io.in, exit.u.io.port,
+		    exit.u.io.operand_size);
+		check((st->gprs[NVMM_X64_GPR_RAX] & 0xFFFF) == 0x1234,
+		    "first out: ax 0x%jx", (uintmax_t)st->gprs[NVMM_X64_GPR_RAX]);
+		check(exit.u.io.npc == 0x1005, "first out: npc 0x%jx",
+		    (uintmax_t)exit.u.io.npc);
+		skip_io(comm, &exit);
+	}
+	error = run_until(fd, machid, &exit);
+	if (expect_exit("second out", error, &exit, NVMM_VCPU_EXIT_IO)) {
+		check((st->gprs[NVMM_X64_GPR_RAX] & 0xFFFF) == 0x1235,
+		    "second out: ax 0x%jx (inc ax not run?)",
+		    (uintmax_t)st->gprs[NVMM_X64_GPR_RAX]);
+		skip_io(comm, &exit);
+	}
+
+	/* sti; hlt. */
+	error = run_until(fd, machid, &exit);
+	expect_exit("hlt", error, &exit, NVMM_VCPU_EXIT_HALTED);
+
+	/* Interrupt 0x20 injected: the handler does out 0x81,al. */
+	memset(&comm->event, 0, sizeof(comm->event));
+	comm->event.type = NVMM_VCPU_EVENT_INTR;
+	comm->event.vector = 0x20;
+	comm->event_commit = true;
+	error = run_until(fd, machid, &exit);
+	if (expect_exit("injected int 0x20", error, &exit, NVMM_VCPU_EXIT_IO)) {
+		check(exit.u.io.port == 0x81 &&
+		    (st->gprs[NVMM_X64_GPR_RAX] & 0xFF) == 0x55,
+		    "int 0x20 handler: port 0x%x al 0x%jx", exit.u.io.port,
+		    (uintmax_t)(st->gprs[NVMM_X64_GPR_RAX] & 0xFF));
+		skip_io(comm, &exit);
+	}
+	/* iret back after hlt, jmp, hlt again. */
+	error = run_until(fd, machid, &exit);
+	expect_exit("hlt after iret", error, &exit, NVMM_VCPU_EXIT_HALTED);
+
+	/* Many entries and exits: hlt, jmp, hlt... */
+	nhalt = 0;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	for (i = 0; i < 100000; i++) {
+		error = run_until(fd, machid, &exit);
+		if (error != 0 || exit.reason != NVMM_VCPU_EXIT_HALTED)
+			break;
+		nhalt++;
+	}
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	us = ((t1.tv_sec - t0.tv_sec) * 1e9 + (t1.tv_nsec - t0.tv_nsec)) /
+	    1e3 / (nhalt ? nhalt : 1);
+	check(nhalt == 100000, "hlt loop stopped at %d: %s, exit %s", nhalt,
+	    strerror(error), exit_name(exit.reason));
+	printf("  %d hlt exits to userland, %.2f us each\n", nhalt, us);
+
+	/* The vCPU moved across every host CPU: remote VMCLEAR, host fields. */
+	ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+	for (cpu = 0; cpu < ncpu; cpu++) {
+		if (!pin_to_cpu(cpu)) {
+			check(false, "pin to CPU %d", cpu);
+			continue;
+		}
+		for (i = 0; i < 100; i++) {
+			error = run_until(fd, machid, &exit);
+			if (error != 0 || exit.reason != NVMM_VCPU_EXIT_HALTED)
+				break;
+		}
+		check(i == 100, "on CPU %d: run %d: %s, exit %s", cpu, i,
+		    strerror(error), exit_name(exit.reason));
+	}
+	(void)pin_to_cpu(-1);
+	printf("  ran on %ld host CPUs in turn\n", ncpu);
+
+	munmap(comm, ps);
+out:
+	error = machine_destroy(fd, machid);
+	check(error == 0, "destroy machine: %s", strerror(error));
+	check_counters("run");
+}
+
 /*
  * A child opens its own /dev/nvmm, creates machines and vCPUs, maps their
  * comm pages and exits without destroying anything: closing the
@@ -755,10 +995,13 @@ test_exit_without_destroy(void)
 }
 
 int
-main(void)
+main(int argc, char **argv)
 {
 	struct counters end;
+	bool only_run;
 	int fd;
+
+	only_run = argc > 1 && strcmp(argv[1], "run") == 0;
 
 	fd = open_nvmm();
 	{
@@ -771,13 +1014,17 @@ main(void)
 	get_counters(&base);
 	print_counters("at start:", &base);
 
-	test_machines(fd);
-	test_vcpus(fd);
-	test_state(fd);
-	test_configure_inject(fd);
-	test_memory(fd);
+	if (!only_run) {
+		test_machines(fd);
+		test_vcpus(fd);
+		test_state(fd);
+		test_configure_inject(fd);
+		test_memory(fd);
+	}
+	test_run(fd);
 	close(fd);
-	test_exit_without_destroy();
+	if (!only_run)
+		test_exit_without_destroy();
 
 	get_counters(&end);
 	print_counters("at end:", &end);
