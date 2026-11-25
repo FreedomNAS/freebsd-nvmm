@@ -45,10 +45,90 @@ __RCSID("$NetBSD: nvmmctl.c,v 1.2 2020/09/05 07:22:26 maxv Exp $");
 #include <string.h>
 #include <unistd.h>
 #include <time.h>
+#if defined(__FreeBSD__)
+#include <libutil.h>	/* humanize_number() */
+#else
 #include <util.h>
+#endif
 #include <nvmm.h>
 
+#if defined(__FreeBSD__)
+#define __dead	__dead2
+
+/* NetBSD's <x86/specialreg.h> */
+#define XCR0_FLAGS1	"\177\020"					  \
+	"b\000"		"x87\0"						  \
+	"b\001"		"SSE\0"						  \
+	"b\002"		"AVX\0"						  \
+	"b\003"		"BNDREGS\0"					  \
+	"b\004"		"BNDCSR\0"					  \
+	"b\005"		"Opmask\0"					  \
+	"b\006"		"ZMM_Hi256\0"					  \
+	"b\007"		"Hi16_ZMM\0"					  \
+	"b\010"		"PT\0"						  \
+	"b\011"		"PKRU\0"					  \
+	"b\013"		"CET_U\0"					  \
+	"b\014"		"CET_S\0"					  \
+	"b\015"		"HDC\0"						  \
+	"b\017"		"LBR\0"						  \
+	"b\020"		"HWP\0"						  \
+	"b\021"		"TILECFG\0"					  \
+	"b\022"		"TILEDATA\0"					  \
+	"b\076"		"LWP\0"						  \
+	"b\077"		"X\0"
+
+/*
+ * FreeBSD has no snprintb(3). The subset used here: the old format
+ * ("\20" then <bit number, 1-based><name>...) and the new one ("\177\020"
+ * then "b<bit, 0-based><name>\0"...), printed as NetBSD does:
+ * 0x<value><NAME,NAME>.
+ */
+static int
+snprintb(char *buf, size_t size, const char *fmt, uint64_t val)
+{
+	const char *p;
+	size_t len;
+	bool any = false;
+
+	len = (size_t)snprintf(buf, size, "0x%jx", (uintmax_t)val);
+#define APPEND(str) do {						\
+		if (len < size)						\
+			len += strlcpy(buf + len, (str), size - len);	\
+	} while (0)
+	if (fmt[0] == '\177') {
+		for (p = fmt + 2; *p == 'b'; p += strlen(p) + 1) {
+			unsigned bit = (unsigned char)p[1];
+
+			if (bit < 64 && (val & (1ULL << bit))) {
+				APPEND(any ? "," : "<");
+				APPEND(p + 2);
+				any = true;
+			}
+		}
+	} else {
+		for (p = fmt + 1; *p != '\0';) {
+			unsigned bit = (unsigned char)*p++ - 1;
+			char name[32];
+			size_t n = 0;
+
+			while (*p > ' ' && n < sizeof(name) - 1)
+				name[n++] = *p++;
+			name[n] = '\0';
+			if (bit < 64 && (val & (1ULL << bit))) {
+				APPEND(any ? "," : "<");
+				APPEND(name);
+				any = true;
+			}
+		}
+	}
+	if (any)
+		APPEND(">");
+#undef APPEND
+	return (int)len;
+}
+#else
 #include <x86/specialreg.h>
+#endif
 
 __dead static void usage(void);
 static void nvmm_identify(char **);

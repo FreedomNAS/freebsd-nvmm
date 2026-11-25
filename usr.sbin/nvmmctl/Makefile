@@ -1,20 +1,14 @@
-#	$NetBSD: Makefile,v 1.3 2020/09/26 17:49:50 jmcneill Exp $
+# nvmmctl(8) for FreeBSD, from NetBSD's usr.sbin/nvmmctl, in /usr/sbin
+# (PORTING.md, decision P6-1). Not setgid: /dev/nvmm is root:wheel 0600
+# until the group is decided with the FreedomNAS VM module.
 
-.include <bsd.own.mk>
+PROG=		nvmmctl
+MAN=		nvmmctl.8
+BINDIR=		/usr/sbin
 
-MAN=	nvmmctl.8
-
-.if ${HAVE_NVMM:Uno} == "yes"
-USE_FORT?=yes	# setgid
-PROG=nvmmctl
-SRCS=nvmmctl.c
-
-BINGRP=nvmm
-BINMODE=2555
-
-CPPFLAGS+=-D_KERNTYPES
-LDADD+=-lutil -lnvmm
-DPADD+=${LIBUTIL} ${LIBNVMM}
-.endif
+CFLAGS+=	-I${.CURDIR}/../../lib/libnvmm -I${.CURDIR}/../../sys
+LDFLAGS+=	-L${.OBJDIR}/../../lib/libnvmm
+LDADD+=		-lutil -lnvmm
+WARNS?=		3
 
 .include <bsd.prog.mk>
