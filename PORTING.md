@@ -187,7 +187,7 @@ bhyve (`sys/amd64/vmm`, `sys/dev/vmm`).
 | IPI su una CPU con attesa | `xc_unicast` + `xc_wait` | `lwkt_send_ipiq` + `lwkt_wait_ipiq` | `smp_rendezvous_cpus(set, smp_no_rendezvous_barrier, fn, smp_no_rendezvous_barrier, arg)` |
 | IPI su tutte le CPU | `xc_broadcast` | `lwkt_cpusync_simple` | `smp_rendezvous(NULL, fn, NULL, arg)` (usato da bhyve per VMXON/VMXOFF) |
 | kick di una vCPU in esecuzione | finto TLB shootdown | gd_reqflags | vettore proprio da `lapic_ipi_alloc(pti ? &IDTVEC(justreturn1_pti) : &IDTVEC(justreturn))`, poi `ipi_cpu()`/`ipi_selected()`; liberarlo con `lapic_ipi_free()` allo scarico |
-| resume da S3 (VMXON perso) | pmf | — | puntatore `vmm_resume_p` (uno solo, chiamato da `mp_x86.c`): libero se vmm.ko non c'è. Fase successiva. |
+| sospensione/ripresa S3 (VMXON perso) | pmf | — | `EVENTHANDLER(power_suspend)` → VMXOFF su tutte le CPU, `EVENTHANDLER(power_resume)` → VMXON. Non `vmm_resume_p`: `mp_x86.c` lo chiama solo sulle AP, mai sulla CPU 0 (vedi **F2-3**). |
 
 ### 3.4 FPU, MSR, registri
 
@@ -268,7 +268,7 @@ sulla tua macchina di test, e con un commit per passo logico.
 | Fase | Contenuto | Test di accettazione (tuo, su hardware dedicato) |
 |---|---|---|
 | **1. Scheletro** | `sys/modules/nvmm/Makefile`, `sys/dev/nvmm/`: frontend NetBSD convertito alle `os_*`, ramo `__FreeBSD__` in `nvmm_os.h`, `nvmm_freebsd.c` con device e modulo; `vmx_ident` reale (VMX, EPT, unrestricted guest, INVEPT/INVVPID) senza VMXON; rifiuto se vmm.ko è presente; `/dev/nvmm` con `NVMM_IOC_CAPABILITY` funzionante e `ENOSYS` per il resto | build pulita; `kldload` su i5 → messaggio "attached"; su CPU senza VMX/EPT/UG → rifiuto con messaggio, niente panic; con vmm.ko caricato → rifiuto; un piccolo programma legge la capability; `kldunload` pulito |
-| **2. VMXON per CPU** | `vmx_init/fini`: `IA32_FEATURE_CONTROL`, `CR4.VMXE`, regioni VMXON, `smp_rendezvous`, VMXOFF allo scarico, vettore IPI | load/unload ripetuti 100 volte; `kldload vmm` dopo nvmm rifiutato (secondo **D3**) |
+| **2. VMXON per CPU** | `vmx_init/fini`: `IA32_FEATURE_CONTROL`, `CR4.VMXE`, regioni VMXON, `smp_rendezvous`, VMXOFF allo scarico, sospensione/ripresa (F2-1..3) | load/unload ripetuti 100 volte; `kldload vmm` dopo nvmm rifiutato (secondo **D3**) |
 | **3. Macchina e vCPU** | vmspace EPT, VMCS, VPID, MSR/I/O bitmap, comm page nel processo, ioctl create/destroy/configure/setstate/getstate | creazione e distruzione di 128 macchine; uscita del processo senza distruggere → nessun leak (`vmstat -m`, `sysctl vm.stats`) |
 | **4. Memoria guest** | `hva_map/unmap`, `gpa_map/unmap`, oggetti VM, fault, protocollo `pm_eptgen` | test che mappa, scrive dall'host e rilegge dal pmap guest; unmap mentre un'altra vCPU gira |
 | **5. vcpu_run** | ciclo di esecuzione, uscite, iniezione eventi, FPU, segnali | guest minimale (pochi byte di codice in real mode che fa `out` e `hlt`), poi un kernel Linux con `-kernel` |
@@ -290,6 +290,19 @@ correzioni NetBSD↔DragonFly, sysctl/statistiche, pacchetto FreeBSD.
 | **D3. vmm.ko caricato dopo nvmm.ko** | nvmm.ko dichiara anche **`MODULE_VERSION(vmm, 1)`** | il linker rifiuta vmm.ko prima di eseguirne il codice; più il controllo al caricamento di nvmm.ko se vmm è già presente. |
 | Permessi di `/dev/nvmm` | `root:wheel 0600` nella fase 1 | il gruppo dedicato si decide con il modulo VM di FreedomNAS. |
 | Repo | `~/git-projects/freedomnas/freebsd-nvmm`, commit locali | nessun remoto finché non lo crei tu. |
+| Copyright dei file nuovi | `Sarah Chiandotto` | confermato 2026-11-25. |
+
+### Decisioni della fase 2 (2026-11-25)
+
+| | Decisione | Note |
+|---|---|---|
+| **F2-1. VMXON fallisce su una CPU** | **rifiuto pulito**: esito registrato CPU per CPU, VMXOFF su quelle già accese, `kldload` fallisce con messaggio che nomina la CPU | NetBSD fa panic; senza console sarebbe una macchina che smette di rispondere. |
+| **F2-2. `CR4.VMXE` già acceso al caricamento** | **rifiuto**: "VMX already in use by another hypervisor" | un altro hypervisor (es. VirtualBox con una VM accesa) è in VMX root; allo scarico gli spegneremmo VMX sotto i piedi. |
+| **F2-3. Ripresa da S3** | **subito**, via `power_suspend`/`power_resume` → `nvmm_suspend()`/`nvmm_resume()` del frontend → VMXOFF/VMXON su tutte le CPU | scelto `power_*` invece di `vmm_resume_p` perché quest'ultimo non copre la CPU 0. Non provabile sulla macchina senza schermo. |
+
+Il resto di `vmx_init` NetBSD (bitmap VPID, tipo di INVEPT/INVVPID, tipo
+EPTP, L1TF, leaf CPUID massimi) arriva con la fase 3, dove viene usato. Il
+vettore IPI per i kick delle vCPU arriva con la fase 5.
 
 ---
 
