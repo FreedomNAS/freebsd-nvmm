@@ -3707,7 +3707,9 @@ vmx_capability(struct nvmm_capability *cap)
 /* -------------------------------------------------------------------------- */
 
 /*
- * FPU. NetBSD's fpu_area_restore/fpu_area_save, with FreeBSD's
+ * FPU. NetBSD's fpu_area_restore/fpu_area_save (whose bool selects the
+ * 32-bit format; here it selects XSAVE/XRSTOR over FXSAVE/FXRSTOR, and the
+ * 64-bit forms are always used), with FreeBSD's
  * fpu_kern_enter(FPU_KERN_NOCTX) around them (decision P5-2): it saves the
  * thread's FPU state if live, enters a critical section and lets us use
  * the FPU registers; fpu_kern_leave() lets the thread reload its state
@@ -3860,8 +3862,13 @@ vmx_vcpu_guest_fpu_leave(struct nvmm_cpu *vcpu)
 	 * Save any extended CPU state that could be in use by the
 	 * guest.
 	 */
-	/* TODO: should we use *XSAVE64 here? */
-	vmx_fpu_save(&cpudata->gfpu, cpudata->xcr0_mask, false);
+	/*
+	 * FreeBSD: XSAVE. NetBSD calls fpu_area_save(..., false) here, where
+	 * the flag picks the 32-bit FXSAVE/XSAVE format, not XSAVE itself;
+	 * taken as "no XSAVE", the guest's AVX upper halves were never
+	 * saved and came back as zeros.
+	 */
+	vmx_fpu_save(&cpudata->gfpu, cpudata->xcr0_mask, true);
 
 	/*
 	 * If the host XCR0 is different from the maximum guest XCR0,
