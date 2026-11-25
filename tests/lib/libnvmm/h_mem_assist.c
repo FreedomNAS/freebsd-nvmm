@@ -40,12 +40,18 @@
 #include <sys/mman.h>
 #include <machine/segments.h>
 #include <machine/psl.h>
+#if defined(__FreeBSD__)
+#include "nvmm_compat.h"	/* PTE_*, PSL_MBO, specialreg */
+#else
 #include <machine/pte.h>
 #include <x86/specialreg.h>
+#endif
 
 #include <nvmm.h>
 
+#ifndef PAGE_SIZE
 #define PAGE_SIZE 4096
+#endif
 
 static uint8_t mmiobuf[PAGE_SIZE];
 static uint8_t *instbuf;
