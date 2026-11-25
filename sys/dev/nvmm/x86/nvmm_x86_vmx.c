@@ -3008,6 +3008,16 @@ vmx_vcpu_init(struct nvmm_machine *mach, struct nvmm_cpu *vcpu)
 	cpudata->cstar = rdmsr(MSR_CSTAR);
 	cpudata->sfmask = rdmsr(MSR_SF_MASK);
 
+	/*
+	 * The RESET TSC (0) starts now. gtsc_last is the RESET value, so
+	 * that QEMU writing it back at reset keeps this offset on every vCPU,
+	 * instead of only on those it already read the TSC from.
+	 */
+	cpudata->gtsc_offset = nvmm_x86_reset_state.msrs[NVMM_X64_MSR_TSC] -
+	    rdtsc();
+	cpudata->gtsc_last = nvmm_x86_reset_state.msrs[NVMM_X64_MSR_TSC];
+	cpudata->gtsc_want_update = true;
+
 	/* Install the RESET state. */
 	memcpy(&vcpu->comm->state, &nvmm_x86_reset_state,
 	    sizeof(nvmm_x86_reset_state));
