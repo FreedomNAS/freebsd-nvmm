@@ -205,7 +205,7 @@ nvmm_identify(char **argv)
 	printf("nvmm: Max machines %u\n", cap.max_machines);
 	printf("nvmm: Max VCPUs per machine %u\n", cap.max_vcpus);
 
-	if (humanize_number(ram, sizeof(ram), cap.max_ram, NULL, HN_AUTOSCALE,
+	if (humanize_number(ram, sizeof(ram), cap.max_ram, "", HN_AUTOSCALE,
 	    (HN_DECIMAL | HN_B | HN_NOSPACE)) == -1)
 		err(EXIT_FAILURE, "humanize_number");
 	printf("nvmm: Max RAM per machine %s\n", ram);
@@ -249,7 +249,7 @@ nvmm_list(char **argv)
 		ts = asctime(localtime(&machinfo.time));
 		ts[strlen(ts) - 1] = '\0';
 
-		if (humanize_number(ram, sizeof(ram), machinfo.nram, NULL,
+		if (humanize_number(ram, sizeof(ram), machinfo.nram, "",
 		    HN_AUTOSCALE, (HN_DECIMAL | HN_B | HN_NOSPACE)) == -1)
 			err(EXIT_FAILURE, "humanize_number");
 
