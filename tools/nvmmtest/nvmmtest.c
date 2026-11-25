@@ -505,6 +505,7 @@ test_exit_without_destroy(void)
 	int status;
 
 	printf("exit without destroy: 4 machines x 4 vcpus in a child\n");
+	fflush(stdout);	/* or the child prints the parent's buffer again */
 	pid = fork();
 	if (pid == -1)
 		err(1, "fork");
