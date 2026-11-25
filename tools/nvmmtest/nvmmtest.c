@@ -525,6 +525,7 @@ test_exit_without_destroy(void)
 		}
 		get_counters(&mid);
 		print_counters("in the child:", &mid);
+		fflush(stdout);
 		_exit(0);
 	}
 	if (waitpid(pid, &status, 0) == -1)
