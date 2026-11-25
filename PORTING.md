@@ -436,3 +436,33 @@ Sulla macchina di test (i5-4440, 4 CPU):
 
 Non provato: sospensione S3 (macchina senza schermo) e i rami d'errore
 (VMXE occupato, VMXON fallito), che su questo hardware non si presentano.
+
+## 10. Fase 3: macchine e vCPU (2026-11-25)
+
+Fatto (commit `0c603ed`…`d07c370`): vmspace con pmap EPT come bhyve,
+vettore IPI allocato al caricamento, contatori `hw.nvmm.*`,
+`nvmm_x86.c` su FreeBSD, backend VMX per macchine e vCPU (VMCS con
+VMCLEAR remoto, MSR bitmap e lista MSR guest, VPID con mutex spin perché
+preso nella sezione critica della VMCS, setstate/getstate, configure
+CPUID/TPR/XCR0, iniezione eventi, suspend/resume per vCPU), ioctl aperti
+tranne memoria e `vcpu_run`, `tools/nvmmtest`.
+
+Bug NetBSD/DragonFly trovati in questa fase (da segnalare):
+- stato di RESET con `fx_mxcsr_mask` a 0: setstate fa `mxcsr &= mask` e
+  una vCPU nuova parte con MXCSR 0 invece di 0x1F80 (QEMU lo nasconde
+  passando sempre la sua maschera);
+- `vmx_vcpu_create`/`vmx_vcpu_destroy` liberano la cpudata con
+  `sizeof(*cpudata)`, mentre è allocata con l'area XSAVE in coda.
+
+Sulla macchina di test (i5-4440), `nvmmtest` 3 giri di fila, tutti OK:
+
+| Prova | Risultato |
+|---|---|
+| 128 macchine, la 129ª `ENOBUFS`, distruzione doppia rifiutata | ok |
+| 256 vCPU in una macchina, oltre il limite e doppione rifiutati | ok |
+| stato di RESET (RIP, CS, CR0, CR4 senza VMXE, DR7, FPU, MXCSR) | ok |
+| setstate/getstate a 64 bit (GPR, segmenti, CR, DR, MSR, FPU) | ok |
+| configure CPUID/TPR/XCR0 validi e non validi, iniezione #GP | ok |
+| `VCPU_RUN`, `GPA_MAP`, `HVA_MAP` → `ENOSYS` | ok |
+| figlio con 4 macchine × 4 vCPU che esce senza distruggere | ok: nel figlio `kpages 68` (4 VMXON + 16 vCPU × 4 pagine), dopo l'uscita di nuovo 4 |
+| contatori `hw.nvmm.*` dopo ogni passo, `kldunload` finale | tornati ai valori iniziali, scarico pulito |
