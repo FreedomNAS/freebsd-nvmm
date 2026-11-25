@@ -1508,6 +1508,172 @@ out:
 
 /* -------------------------------------------------------------------------- */
 
+/* -------------------------------------------------------------------------- */
+
+/*
+ * Guest AVX state (YMM, 256 bits) across exits. The guest runs in 32-bit
+ * protected mode with CR4.OSXSAVE and XCR0 = x87|SSE|AVX, loads YMM0 from
+ * 0x3000, makes 1000 exits, stores YMM0 at 0x3020. With "host_avx" the
+ * host loads other values in YMM0/YMM1 around every run.
+ */
+static const uint8_t guest_avx[] = {
+	0xC5, 0xFE, 0x6F, 0x05, 0x00, 0x30, 0x00, 0x00,	/* vmovdqu ymm0,[0x3000] */
+	0xB9, 0xE8, 0x03, 0x00, 0x00,			/* mov ecx,1000 */
+	0xE6, 0x87,					/* out 0x87,al */
+	0x49,						/* dec ecx */
+	0x75, 0xFB,					/* jnz out */
+	0xC5, 0xFE, 0x7F, 0x05, 0x20, 0x30, 0x00, 0x00,	/* vmovdqu [0x3020],ymm0 */
+	0xF4,						/* hlt */
+};
+
+static int
+run_with_host_ymm(int fd, struct nvmm_ioc_vcpu_run *args, const uint8_t in[32])
+{
+	long ret, rdx = (long)args;
+	uint8_t cf;
+
+	__asm volatile(
+	    "vmovdqu (%[in]), %%ymm0\n\t"
+	    "vmovdqu (%[in]), %%ymm1\n\t"
+	    "syscall\n\t"
+	    "setc %[cf]\n\t"
+	    "vzeroupper\n\t"
+	    : "=a" (ret), [cf] "=&b" (cf), "+d" (rdx)
+	    : "a" ((long)SYS_ioctl), "D" ((long)fd),
+	      "S" ((long)NVMM_IOC_VCPU_RUN), [in] "r" (in)
+	    : "rcx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "memory",
+	      "cc");
+	return cf ? (int)ret : 0;
+}
+
+static void
+test_run_avx_one(int fd, bool host_avx)
+{
+	size_t ps = (size_t)getpagesize();
+	struct nvmm_ioc_vcpu_run args;
+	struct nvmm_comm_page *comm;
+	struct nvmm_x64_state *st;
+	uint8_t *mem, gpat[32], hostv[32];
+	nvmm_machid_t machid;
+	int error, i, nouts;
+
+	error = machine_create(fd, &machid);
+	check(error == 0, "machine: %s", strerror(error));
+	if (error)
+		return;
+	error = vcpu_create(fd, machid, 0);
+	check(error == 0, "vcpu: %s", strerror(error));
+	if (error)
+		goto out;
+	comm = comm_map(fd, machid, 0);
+	st = &comm->state;
+
+	mem = mmap(NULL, 4 * ps, PROT_READ | PROT_WRITE, MAP_ANON |
+	    MAP_PRIVATE, -1, 0);
+	if (mem == MAP_FAILED)
+		err(1, "mmap");
+	if (hva_map(fd, machid, mem, 4 * ps) != 0 ||
+	    gpa_map(fd, machid, mem, 0, 4 * ps,
+	    PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+		check(false, "guest memory");
+		goto out;
+	}
+	memset(mem, 0, 4 * ps);
+	memcpy(mem + 0x1400, guest_avx, sizeof(guest_avx));
+	fill(gpat, sizeof(gpat), 0x3D);
+	memcpy(mem + 0x3000, gpat, sizeof(gpat));
+
+	/* Flat 32-bit protected mode, AVX enabled. */
+	comm->state_wanted = NVMM_X64_STATE_ALL;
+	comm->state_cached = 0;
+	(void)vcpu_ioctl(fd, NVMM_IOC_VCPU_GETSTATE, machid, 0);
+	for (i = 0; i < NVMM_X64_NSEG; i++) {
+		struct nvmm_x64_state_seg *sg = &st->segs[i];
+
+		if (i == NVMM_X64_SEG_GDT || i == NVMM_X64_SEG_IDT)
+			continue;
+		sg->base = 0;
+		sg->limit = 0xFFFFFFFF;
+		sg->attrib.s = (i != NVMM_X64_SEG_LDT && i != NVMM_X64_SEG_TR);
+		sg->attrib.p = 1;
+		sg->attrib.def = 1;
+		sg->attrib.g = 1;
+		sg->attrib.type = (i == NVMM_X64_SEG_CS) ? 11 :
+		    (i == NVMM_X64_SEG_TR) ? 11 : (i == NVMM_X64_SEG_LDT) ? 2 : 3;
+		sg->selector = (i == NVMM_X64_SEG_CS) ? 0x08 : 0x10;
+	}
+	st->crs[NVMM_X64_CR_CR0] = 0x33;		/* PE MP ET NE */
+	st->crs[NVMM_X64_CR_CR4] = 0x40600;		/* OSFXSR XMMEXCPT OSXSAVE */
+	st->crs[NVMM_X64_CR_XCR0] = 0x7;		/* x87 SSE AVX */
+	st->gprs[NVMM_X64_GPR_RIP] = 0x1400;
+	st->gprs[NVMM_X64_GPR_RFLAGS] = 0x2;
+	comm->state_commit = NVMM_X64_STATE_SEGS | NVMM_X64_STATE_GPRS |
+	    NVMM_X64_STATE_CRS;
+
+	nouts = 0;
+	for (i = 0; i < 100000 && nouts < 1000; i++) {
+		fill(hostv, sizeof(hostv), (uint8_t)(0x90 + i));
+		memset(&args, 0, sizeof(args));
+		args.machid = machid;
+		error = host_avx ? run_with_host_ymm(fd, &args, hostv) :
+		    vcpu_run(fd, machid, 0, &args.exit);
+		if (error != 0) {
+			check(false, "run: %s", strerror(error));
+			break;
+		}
+		if (args.exit.reason == NVMM_VCPU_EXIT_NONE)
+			continue;
+		if (args.exit.reason != NVMM_VCPU_EXIT_IO ||
+		    args.exit.u.io.port != 0x87) {
+			check(false, "avx loop: exit %s (0x%jx hw %ju) port 0x%x",
+			    exit_name(args.exit.reason),
+			    (uintmax_t)args.exit.reason,
+			    (uintmax_t)args.exit.u.inv.hwcode,
+			    args.exit.u.io.port);
+			break;
+		}
+		skip_io(comm, &args.exit);
+		nouts++;
+	}
+	check(nouts == 1000, "avx loop: %d exits", nouts);
+	{
+		struct nvmm_vcpu_exit exit;
+
+		error = run_until(fd, machid, &exit);
+		if (expect_exit("avx hlt", error, &exit,
+		    NVMM_VCPU_EXIT_HALTED)) {
+			check(memcmp(mem + 0x3020, gpat, 16) == 0,
+			    "guest YMM0 low 128 bits lost (host_avx %d)",
+			    host_avx);
+			check(memcmp(mem + 0x3030, gpat + 16, 16) == 0,
+			    "guest YMM0 HIGH 128 bits lost (host_avx %d): "
+			    "%02x%02x.. want %02x%02x..", host_avx,
+			    mem[0x3030], mem[0x3031], gpat[16], gpat[17]);
+		}
+	}
+	printf("  host AVX %s: guest YMM0 after 1000 exits %s\n",
+	    host_avx ? "on " : "off", memcmp(mem + 0x3020, gpat, 32) == 0 ?
+	    "intact" : "CORRUPTED");
+
+	munmap(comm, ps);
+out:
+	error = machine_destroy(fd, machid);
+	check(error == 0, "destroy machine: %s", strerror(error));
+	check_counters("run avx");
+}
+
+static void
+test_run_avx(int fd)
+{
+	printf("run: guest AVX (YMM) state across exits\n");
+	if (!__builtin_cpu_supports("avx")) {
+		printf("  no AVX on this host: skipped\n");
+		return;
+	}
+	test_run_avx_one(fd, false);
+	test_run_avx_one(fd, true);
+}
+
 /*
  * Step 5e. A guest that never exits by itself ("jmp $") must still give
  * the CPU back: on a signal, on comm->stop, when the scheduler wants the
@@ -1826,6 +1992,15 @@ main(int argc, char **argv)
 	int fd;
 
 	only_run = argc > 1 && strcmp(argv[1], "run") == 0;
+	if (argc > 1 && strcmp(argv[1], "avx") == 0) {
+		setvbuf(stdout, NULL, _IOLBF, 0);
+		fd = open_nvmm();
+		get_counters(&base);
+		test_run_avx(fd);
+		close(fd);
+		printf("%s\n", nfail ? "FAILED" : "OK");
+		return nfail ? 1 : 0;
+	}
 	setvbuf(stdout, NULL, _IOLBF, 0);
 
 	fd = open_nvmm();
@@ -1850,6 +2025,7 @@ main(int argc, char **argv)
 	test_run_ept(fd);
 	test_run_cpuid_msr(fd);
 	test_run_fpu(fd);
+	test_run_avx(fd);
 	test_run_signals(fd);
 	close(fd);
 	if (!only_run)
