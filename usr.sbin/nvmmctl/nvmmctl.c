@@ -96,7 +96,8 @@ snprintb(char *buf, size_t size, const char *fmt, uint64_t val)
 			len += strlcpy(buf + len, (str), size - len);	\
 	} while (0)
 	if (fmt[0] == '\177') {
-		for (p = fmt + 2; *p == 'b'; p += strlen(p) + 1) {
+		/* "b" <bit byte, may be 0> <name> "\0" */
+		for (p = fmt + 2; *p == 'b'; p += 2 + strlen(p + 2) + 1) {
 			unsigned bit = (unsigned char)p[1];
 
 			if (bit < 64 && (val & (1ULL << bit))) {
