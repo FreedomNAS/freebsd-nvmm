@@ -518,3 +518,23 @@ giro, tutti OK, scarico pulito.
 
 Non provato: emulazione dei bit A/D (Haswell li ha), invalidazioni EPT con
 una vCPU in esecuzione (fase 5).
+
+## 12. Fase 5 (in corso)
+
+### 5a: assembly, ciclo, HLT, I/O, EPT violation, interrupt, NMI (2026-11-25)
+
+Commit `1edfa41`, `3f66521`, `6594a84`, `8ff5764`. Primo giro: nessun
+panic, ma il guest non partiva (uscita 48, EPT violation, che avevo messo
+nel 5b: con memoria paginabile serve dalla prima istruzione). Corretto.
+
+Sulla macchina di test, micro-guest in real mode (`nvmmtest run`) e poi
+`nvmmtest` completo, OK:
+
+| Prova | Risultato |
+|---|---|
+| `out 0x80,ax` due volte, valori 0x1234 e 0x1235, `npc` giusto | ok |
+| `sti; hlt` → uscita HALTED | ok |
+| interrupt 0x20 iniettato: handler `out 0x81,al` (0x55), `iret`, di nuovo HALTED | ok |
+| 100000 uscite HLT fino a userland | ok, 3,35 µs l'una (ioctl, entry/exit, FPU) |
+| vCPU spostata su tutte e 4 le CPU (VMCLEAR remoto, campi host per CPU) | ok |
+| contatori e `kldunload` a fine prova | ok |
