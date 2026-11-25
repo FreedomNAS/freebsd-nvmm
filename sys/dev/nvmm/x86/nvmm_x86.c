@@ -28,12 +28,15 @@
  * SUCH DAMAGE.
  */
 
+#if defined(__NetBSD__)
 #include <sys/cdefs.h>
 __KERNEL_RCSID(0, "$NetBSD: nvmm_x86.c,v 1.25 2026/07/15 01:22:21 riastradh Exp $");
+#endif
 
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/kernel.h>
+#if defined(__NetBSD__)
 #include <sys/cpu.h>
 
 #include <uvm/uvm_extern.h>
@@ -41,10 +44,15 @@ __KERNEL_RCSID(0, "$NetBSD: nvmm_x86.c,v 1.25 2026/07/15 01:22:21 riastradh Exp 
 #include <x86/cputypes.h>
 #include <x86/pat.h>
 #include <x86/specialreg.h>
+#endif
 
 #include <dev/nvmm/nvmm.h>
+#include <dev/nvmm/nvmm_os.h>
 #include <dev/nvmm/nvmm_internal.h>
 #include <dev/nvmm/x86/nvmm_x86.h>
+#if defined(__FreeBSD__)
+#include <dev/nvmm/x86/nvmm_x86_freebsd.h>
+#endif
 
 /*
  * Code shared between x86-SVM and x86-VMX.
@@ -227,6 +235,11 @@ const struct nvmm_x64_state nvmm_x86_reset_state = {
 	}
 };
 
+/*
+ * FreeBSD: the CPUID masks use NetBSD's CPUID feature names; they are
+ * ported together with the CPUID exit handler that uses them (phase 5).
+ */
+#if defined(__NetBSD__)
 const struct nvmm_x86_cpuid_mask nvmm_cpuid_00000001 = {
 	.eax = ~0,
 	.ebx = ~0,
@@ -451,6 +464,8 @@ const struct nvmm_x86_cpuid_mask nvmm_cpuid_80000008 = {
 	.edx = 0
 };
 
+#endif /* __NetBSD__ */
+
 bool
 nvmm_x86_pat_validate(uint64_t val)
 {
@@ -527,7 +542,7 @@ nvmm_x86_xsave_size(uint64_t xcr0)
 		x86_cpuid2(0x0d, i, descs);
 		size = descs[0];	/* CPUID[EAX=0x0d,ECX=i].EAX */
 		offset = descs[1];	/* CPUID[EAX=0x0d,ECX=i].EBX */
-		KASSERT(size <= UINT32_MAX - offset);
+		OS_ASSERT(size <= UINT32_MAX - offset);
 		totalsize = MAX(totalsize, offset + size);
 	}
 
@@ -617,7 +632,7 @@ nvmm_x86_munge_xcr0(uint64_t xcr0, uint64_t xcr0_mask)
 {
 	uint64_t origxcr0 __diagused = xcr0;
 
-	KASSERT(xcr0_mask != 0);
+	OS_ASSERT(xcr0_mask != 0);
 	KASSERTMSG(xcr0_mask & XCR0_X87, "xcr0_mask=0x%"PRIx64, xcr0_mask);
 	KASSERTMSG((xcr0_mask & (XCR0_YMM_Hi128|XCR0_SSE)) != XCR0_YMM_Hi128,
 	    "xcr0_mask=0x%"PRIx64, xcr0_mask);
