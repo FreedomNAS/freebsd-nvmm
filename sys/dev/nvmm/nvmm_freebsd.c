@@ -80,7 +80,7 @@ int (*os_vmspace_pinit)(pmap_t) = NULL;
 static volatile u_long nvmm_stat_kpages;
 static volatile u_long nvmm_stat_vmobjs;
 
-static SYSCTL_NODE(_hw, OID_AUTO, nvmm, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
+SYSCTL_NODE(_hw, OID_AUTO, nvmm, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
     "NVMM hypervisor");
 SYSCTL_ULONG(_hw_nvmm, OID_AUTO, kpages, CTLFLAG_RD,
     __DEVOLATILE(u_long *, &nvmm_stat_kpages), 0,
