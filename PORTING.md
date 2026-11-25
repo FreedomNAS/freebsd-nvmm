@@ -635,3 +635,39 @@ Sulla macchina di test (i5-4440):
 | `kyua debug t_io_assist:io_assist` (NetBSD) | **passed**: 12/12 (IN/OUT byte/word/dword, INS/OUTS con REP) |
 | `kyua debug t_mem_assist:mem_assist` (NetBSD) | **passed**: emulatore MMIO 64 e 16 bit (incl. disp16, XCHG) |
 | contatori e `kldunload` | ok |
+
+## 14. Fase 7: QEMU (in corso, 2026-11-25)
+
+QEMU 11.1.2 (la versione del port) compilato sulla macchina di test con le
+patch del port più `ports/emulators/qemu/files/patch-meson.build`:
+`-accel nvmm` disponibile, linkato a `/usr/lib/libnvmm.so.0`.
+Prova: `tools/guestboot/guestboot.sh` (avvio senza display, tempo fino al
+`login:` sulla seriale).
+
+### Bug trovati con i guest veri
+
+Alpine si fermava al boot (CD non trovato, poi errori d'integrità di
+`apk`). Trovati e corretti, in ordine:
+
+| Commit | Bug | Effetto |
+|---|---|---|
+| `f56162b` | offset del TSC ricalcolato a ogni cambio di CPU fisica (codice NetBSD): perso il tempo fuori dal guest | TSC del guest ~17% lento rispetto a HPET, timeout del guest sbagliati |
+| `c3bd223` | offset del TSC non fissato alla creazione della vCPU | vCPU sfasate (ore) tra loro |
+| `e19a84f` | setstate segnava validi tutti i componenti XSAVE; getstate restituiva aree x87/SSE vecchie (stesso codice in NetBSD e DragonFly) | registri del guest con valori vecchi dopo un setstate di QEMU |
+| `489d0a6` | **stato del guest salvato con FXSAVE e ripristinato con XRSTOR**: il flag di `fpu_area_save()` di NetBSD (formato a 32 bit) letto come "niente XSAVE" | metà alte dei registri AVX azzerate a ogni uscita: decompressione e hash corrotti nel guest |
+
+Escluso con i contatori `hw.nvmm.evt_*` (`0212170`): interrupt persi.
+Prova mirata nuova: `nvmmtest avx` (YMM a 256 bit attraverso 1000 uscite,
+con e senza AVX nell'host): prima corrotto, ora intatto.
+
+### Risultati
+
+| Guest | NVMM | TCG |
+|---|---|---|
+| Alpine 3.24.4 virt, ISO, 2 vCPU, fino al login | **10 s** | 38 s |
+| Alpine, kernel estratto, CD IDE o virtio, 1–2 vCPU | 4 s | 35 s |
+
+Da fare: FreeBSD 15.1 come guest (l'immagine ufficiale non usa la seriale,
+serve un altro modo di verificare l'avvio), warp del TSC tra vCPU (~0,8 s,
+Linux lo tollera passando a HPET), port `emulators/qemu` per il repo
+FreedomNAS.
