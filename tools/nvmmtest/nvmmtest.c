@@ -42,6 +42,7 @@
 #include <sys/cpuset.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <sys/sysctl.h>
 #include <sys/wait.h>
 
@@ -1336,6 +1337,169 @@ out:
 	check_counters("run cpuid/msr");
 }
 
+/* -------------------------------------------------------------------------- */
+
+/*
+ * Step 5d. The guest puts a pattern in XMM0 and makes 1000 exits to
+ * userland; around each run the host loads other values in XMM0 and YMM1
+ * (AVX) and checks them after the ioctl, done with a raw syscall so that
+ * no libc code touches vector registers in between. At the end the guest
+ * stores XMM0: it must still hold its pattern. Then RDTSC with a guest TSC
+ * set from userland.
+ */
+static const uint8_t guest_fpu[] = {
+	0x0F, 0x20, 0xC0,			/* 1300: mov eax,cr0 */
+	0x66, 0x83, 0xE0, 0xFB,			/* 1303: and eax,~CR0_EM */
+	0x66, 0x83, 0xC8, 0x02,			/* 1307: or eax,CR0_MP */
+	0x0F, 0x22, 0xC0,			/* 130B: mov cr0,eax */
+	0x0F, 0x20, 0xE0,			/* 130E: mov eax,cr4 */
+	0x66, 0x0D, 0x00, 0x06, 0x00, 0x00,	/* 1311: or eax,OSFXSR|OSXMMEXCPT */
+	0x0F, 0x22, 0xE0,			/* 1317: mov cr4,eax */
+	0x0F, 0x10, 0x06, 0x00, 0x30,		/* 131A: movups xmm0,[0x3000] */
+	0xB9, 0xE8, 0x03,			/* 131F: mov cx,1000 */
+	0xE6, 0x85,				/* 1322: out 0x85,al */
+	0x49,					/* 1324: dec cx */
+	0x75, 0xFB,				/* 1325: jnz 1322 */
+	0x0F, 0x11, 0x06, 0x10, 0x30,		/* 1327: movups [0x3010],xmm0 */
+	0x0F, 0x31,				/* 132C: rdtsc */
+	0xE6, 0x86,				/* 132E: out 0x86,al */
+	0xF4,					/* 1330: hlt */
+};
+
+/* NVMM_IOC_VCPU_RUN with host XMM0/YMM1 loaded before and saved after. */
+static int
+run_with_host_vectors(int fd, struct nvmm_ioc_vcpu_run *args,
+    const uint8_t in[32], uint8_t outx[16], uint8_t outy[32])
+{
+	long ret;
+	uint8_t cf;
+
+	__asm volatile(
+	    "movdqu (%[in]), %%xmm0\n\t"
+	    "vmovdqu (%[in]), %%ymm1\n\t"
+	    "syscall\n\t"
+	    "setc %[cf]\n\t"
+	    "movdqu %%xmm0, (%[ox])\n\t"
+	    "vmovdqu %%ymm1, (%[oy])\n\t"
+	    "vzeroupper\n\t"
+	    : "=a" (ret), [cf] "=r" (cf)
+	    : "a" ((long)SYS_ioctl), "D" ((long)fd),
+	      "S" ((long)NVMM_IOC_VCPU_RUN), "d" (args),
+	      [in] "r" (in), [ox] "r" (outx), [oy] "r" (outy)
+	    : "rcx", "r11", "xmm0", "xmm1", "memory", "cc");
+	return cf ? (int)ret : 0;
+}
+
+static void
+test_run_fpu(int fd)
+{
+	size_t ps = (size_t)getpagesize();
+	struct nvmm_ioc_vcpu_run args;
+	struct nvmm_comm_page *comm;
+	uint8_t hostv[32], outx[16], outy[32];
+	uint8_t *mem, gpat[16];
+	nvmm_machid_t machid;
+	uint64_t tsc;
+	int error, i, nouts, nbad;
+
+	printf("run: guest SSE state vs host SSE/AVX state, guest TSC\n");
+	if (!__builtin_cpu_supports("avx")) {
+		printf("  no AVX on this host: skipped\n");
+		return;
+	}
+	error = machine_create(fd, &machid);
+	check(error == 0, "machine: %s", strerror(error));
+	if (error)
+		return;
+	error = vcpu_create(fd, machid, 0);
+	check(error == 0, "vcpu: %s", strerror(error));
+	if (error)
+		goto out;
+	comm = comm_map(fd, machid, 0);
+
+	mem = mmap(NULL, 4 * ps, PROT_READ | PROT_WRITE, MAP_ANON |
+	    MAP_PRIVATE, -1, 0);
+	if (mem == MAP_FAILED)
+		err(1, "mmap");
+	if (hva_map(fd, machid, mem, 4 * ps) != 0 ||
+	    gpa_map(fd, machid, mem, 0, 4 * ps,
+	    PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+		check(false, "guest memory");
+		goto out;
+	}
+	memset(mem, 0, 4 * ps);
+	memcpy(mem + 0x1300, guest_fpu, sizeof(guest_fpu));
+	fill(gpat, sizeof(gpat), 0xC3);
+	memcpy(mem + 0x3000, gpat, sizeof(gpat));
+
+	if (!set_real_mode_rip(fd, machid, comm, 0x1300)) {
+		check(false, "state");
+		goto out;
+	}
+	/* Guest TSC starts near 1000. */
+	comm->state_wanted = NVMM_X64_STATE_MSRS;
+	comm->state_cached = 0;
+	(void)vcpu_ioctl(fd, NVMM_IOC_VCPU_GETSTATE, machid, 0);
+	comm->state.msrs[NVMM_X64_MSR_TSC] = 1000;
+	comm->state_commit |= NVMM_X64_STATE_MSRS;
+
+	nouts = nbad = 0;
+	for (i = 0; i < 100000 && nouts < 1000; i++) {
+		fill(hostv, sizeof(hostv), (uint8_t)(0x10 + i));
+		memset(&args, 0, sizeof(args));
+		args.machid = machid;
+		args.cpuid = 0;
+		error = run_with_host_vectors(fd, &args, hostv, outx, outy);
+		if (error != 0) {
+			check(false, "run: %s", strerror(error));
+			break;
+		}
+		if (memcmp(outx, hostv, 16) != 0 ||
+		    memcmp(outy, hostv, 32) != 0)
+			nbad++;
+		if (args.exit.reason == NVMM_VCPU_EXIT_NONE)
+			continue;
+		if (args.exit.reason != NVMM_VCPU_EXIT_IO ||
+		    args.exit.u.io.port != 0x85) {
+			check(false, "fpu loop: exit %s port 0x%x",
+			    exit_name(args.exit.reason), args.exit.u.io.port);
+			break;
+		}
+		skip_io(comm, &args.exit);
+		nouts++;
+	}
+	check(nbad == 0, "host XMM0/YMM1 changed across %d of %d runs", nbad,
+	    i);
+	check(nouts == 1000, "fpu loop: %d exits", nouts);
+
+	/* movups [0x3010],xmm0 ; rdtsc ; out 0x86 */
+	{
+		struct nvmm_vcpu_exit exit;
+
+		error = run_until(fd, machid, &exit);
+		if (expect_exit("rdtsc", error, &exit, NVMM_VCPU_EXIT_IO)) {
+			check(memcmp(mem + 0x3010, gpat, 16) == 0,
+			    "guest XMM0 lost across host FPU use");
+			tsc = (comm->state.gprs[NVMM_X64_GPR_RDX] << 32) |
+			    (comm->state.gprs[NVMM_X64_GPR_RAX] & 0xFFFFFFFF);
+			/* ~1000 runs of a few us: far below 10^10 cycles. */
+			check(tsc > 1000 && tsc < 10000000000ULL,
+			    "guest TSC %ju, set to 1000", (uintmax_t)tsc);
+			printf("  %d runs, host vectors intact; guest TSC %ju\n",
+			    i, (uintmax_t)tsc);
+			skip_io(comm, &exit);
+		}
+		error = run_until(fd, machid, &exit);
+		expect_exit("final hlt", error, &exit, NVMM_VCPU_EXIT_HALTED);
+	}
+
+	munmap(comm, ps);
+out:
+	error = machine_destroy(fd, machid);
+	check(error == 0, "destroy machine: %s", strerror(error));
+	check_counters("run fpu");
+}
+
 /*
  * A child opens its own /dev/nvmm, creates machines and vCPUs, maps their
  * comm pages and exits without destroying anything: closing the
@@ -1424,6 +1588,7 @@ main(int argc, char **argv)
 	test_run(fd);
 	test_run_ept(fd);
 	test_run_cpuid_msr(fd);
+	test_run_fpu(fd);
 	close(fd);
 	if (!only_run)
 		test_exit_without_destroy();
