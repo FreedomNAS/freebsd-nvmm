@@ -300,6 +300,21 @@ correzioni NetBSD↔DragonFly, sysctl/statistiche, pacchetto FreeBSD.
 | **F2-2. `CR4.VMXE` già acceso al caricamento** | **rifiuto**: "VMX already in use by another hypervisor" | un altro hypervisor (es. VirtualBox con una VM accesa) è in VMX root; allo scarico gli spegneremmo VMX sotto i piedi. |
 | **F2-3. Ripresa da S3** | **subito**, via `power_suspend`/`power_resume` → `nvmm_suspend()`/`nvmm_resume()` del frontend → VMXOFF/VMXON su tutte le CPU | scelto `power_*` invece di `vmm_resume_p` perché quest'ultimo non copre la CPU 0. Non provabile sulla macchina senza schermo. |
 
+### Decisioni della fase 3 (2026-11-25)
+
+| | Decisione | Note |
+|---|---|---|
+| **P3-1. VMCS e migrazione delle vCPU** | **come NetBSD/DragonFly**: la VMCS resta caricata sull'ultima CPU, VMCLEAR remoto via IPI (`smp_rendezvous_cpus`) solo quando la vCPU cambia CPU | codice già provato in due sistemi, portato quasi riga per riga. |
+| **P3-2. Verifica dei leak** | **contatori sysctl in sola lettura** `hw.nvmm.machines`, `hw.nvmm.vcpus`, `hw.nvmm.kpages` | devono tornare a 0 dopo ogni prova; utili poi al modulo VM di FreedomNAS. |
+| **P3-3. Strumento di prova** | **`tools/nvmmtest`** con ioctl diretti ora; **i test di libnvmm di NetBSD dopo la fase 5** | una cosa alla volta: libnvmm resta alla fase 6, i suoi test servono `vcpu_run`. |
+
+Per il resto la fase 3 segue bhyve e NetBSD: vmspace con pmap EPT
+(`pmap_pinit_type(PT_EPT)`, `PMAP_EMULATE_AD_BITS` senza bit A/D), vettore
+IPI per le invalidazioni EPT allocato al caricamento con `lapic_ipi_alloc`
+(ripiego `IPI_AST`, anticipato dalla fase 5 perché il pmap EPT lo vuole già
+alla creazione), ioctl aperti solo per macchine e vCPU (memoria e
+`vcpu_run` restano `ENOSYS`).
+
 Il resto di `vmx_init` NetBSD (bitmap VPID, tipo di INVEPT/INVVPID, tipo
 EPTP, L1TF, leaf CPUID massimi) arriva con la fase 3, dove viene usato. Il
 vettore IPI per i kick delle vCPU arriva con la fase 5.
