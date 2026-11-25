@@ -370,3 +370,21 @@ kldload ./nvmm.ko && dmesg | tail      # solo tu, sull'hardware di test
 ```
 
 Io lì compilo e basta: `kldload`/`kldunload` li fai tu.
+
+### Risultato sulla macchina di test (2026-11-25)
+
+Intel Core i5-4440 (Haswell), FreeBSD 15.1-RELEASE-p7, disco
+`netfreebsd` via USB. Repo copiato con `git archive` + `tar` su SSH,
+build pulita (`-Werror`) di `nvmm.ko` e `nvmmcap` sulla macchina.
+
+| Prova | Risultato |
+|---|---|
+| `kldload nvmm.ko` (bootverbose) | ok: "VMX EPT A/D bits present, XCR0 mask 0x7", "attached, using backend x86-vmx"; `/dev/nvmm` `root:wheel 0600` |
+| `nvmmcap` | ok: version 2, state_size 1008, 128 macchine, 256 vCPU, xcr0 0x7, `MACHINE_CREATE` → `ENOSYS` |
+| `kldload vmm` con nvmm caricato | rifiutato da `kldload(8)` stesso ("module already loaded or in kernel"): trova `vmm` via `modfind` grazie a `MODULE_VERSION(vmm, 1)`, prima ancora del linker |
+| `kldunload nvmm` | ok, `/dev/nvmm` sparito |
+| `kldload vmm` poi `nvmm.ko` | nvmm rifiutato dal linker: "interface vmm.1 already present in the KLD 'vmm.ko'!" |
+| `kldunload vmm` | ok, sistema pulito |
+
+Nessun panic. Il messaggio "failed to load CTF for nvmm.ko" è solo
+informativo (modulo senza sezione CTF per DTrace). Fase 1 chiusa.
