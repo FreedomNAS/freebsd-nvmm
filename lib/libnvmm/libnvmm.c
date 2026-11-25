@@ -164,7 +164,16 @@ nvmm_init(void)
 {
 	if (nvmm_fd != -1)
 		return 0;
+#if defined(__FreeBSD__)
+	/*
+	 * FreeBSD refuses a shared writable mmap() (the comm pages) on a
+	 * descriptor opened read-only, which NetBSD allows. O_RDWR is
+	 * still an ordinary owner; only O_WRONLY is the root view.
+	 */
+	nvmm_fd = open("/dev/nvmm", O_RDWR | O_CLOEXEC);
+#else
 	nvmm_fd = open("/dev/nvmm", O_RDONLY | O_CLOEXEC);
+#endif
 	if (nvmm_fd == -1)
 		return -1;
 	if (nvmm_capability(&__capability) == -1) {
