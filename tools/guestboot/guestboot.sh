@@ -9,7 +9,8 @@
 #   guestboot.sh <accel> <name> <timeout-s> -- <qemu disk/cdrom args...>
 #   accel: nvmm or tcg
 #
-# QEMU is ${QEMU} (default: qemu-system-x86_64 in PATH). The serial
+# QEMU is ${QEMU} (default: qemu-system-x86_64 in PATH), with ${SMP:-2}
+# vCPUs. The serial
 # console goes to /tmp/guestboot-<name>-<accel>.serial, QEMU's own output
 # to .qemu. Exit 0 when the prompt appeared.
 
@@ -26,7 +27,7 @@ base=/tmp/guestboot-$name-$accel
 rm -f "$base.serial" "$base.qemu"
 
 start=$(date +%s)
-"$QEMU" -accel "$accel" -cpu max -m 1024 -smp 2 \
+"$QEMU" -accel "$accel" -cpu max -m 1024 -smp "${SMP:-2}" \
     -display none -monitor none -parallel none \
     -serial "file:$base.serial" \
     -nic user,model=virtio-net-pci \
