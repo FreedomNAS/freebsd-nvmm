@@ -46,8 +46,10 @@
 #include <sys/mman.h>
 #include <sys/mutex.h>
 #include <sys/smp.h>
+#include <sys/smr.h>
 
 #include <machine/cpufunc.h>
+#include <machine/fpu.h>
 #include <machine/md_var.h>
 #include <machine/psl.h>
 #include <machine/segments.h>
@@ -66,7 +68,11 @@
  * built (phase 5, with vmlaunch/vmresume) they are C functions. A failing
  * VMREAD/VMWRITE/VMPTRLD/VMCLEAR/INVEPT/INVVPID is a bug in this code.
  */
-/* INVEPT, INVVPID, CLI and STI wrappers come with vcpu_run (phase 5). */
+/* nvmm_x86_vmxfunc.S */
+int vmx_vmlaunch(uint64_t *gprs);
+int vmx_vmresume(uint64_t *gprs);
+void vmx_resume_rip(void);
+
 void vmx_insn_failvalid(void) __dead2;
 void vmx_insn_failinvalid(void) __dead2;
 
@@ -92,6 +98,44 @@ struct vpid_desc {
 	uint64_t vpid;
 	uint64_t addr;
 } __packed;
+
+static inline void
+vmx_invept(uint64_t op, struct ept_desc *desc)
+{
+	__asm volatile (
+		"invept		%[desc],%[op];"
+		"jz		vmx_insn_failvalid;"
+		"jc		vmx_insn_failinvalid;"
+		:
+		: [desc] "m" (*desc), [op] "r" (op)
+		: "memory", "cc"
+	);
+}
+
+static inline void
+vmx_invvpid(uint64_t op, struct vpid_desc *desc)
+{
+	__asm volatile (
+		"invvpid	%[desc],%[op];"
+		"jz		vmx_insn_failvalid;"
+		"jc		vmx_insn_failinvalid;"
+		:
+		: [desc] "m" (*desc), [op] "r" (op)
+		: "memory", "cc"
+	);
+}
+
+static inline void
+vmx_cli(void)
+{
+	__asm volatile ("cli" ::: "memory");
+}
+
+static inline void
+vmx_sti(void)
+{
+	__asm volatile ("sti" ::: "memory");
+}
 
 static inline uint64_t
 vmx_vmread(uint64_t field)
@@ -575,6 +619,9 @@ vmx_vmclear(paddr_t *pa)
 
 /* -------------------------------------------------------------------------- */
 
+static void vmx_vcpu_state_provide(struct nvmm_cpu *, uint64_t);
+static void vmx_vcpu_state_commit(struct nvmm_cpu *);
+
 #define VMX_MSRLIST_STAR		0
 #define VMX_MSRLIST_LSTAR		1
 #define VMX_MSRLIST_CSTAR		2
@@ -751,10 +798,15 @@ static const size_t vmx_vcpu_conf_sizes[NVMM_X86_VCPU_NCONF] = {
 };
 
 /*
- * FreeBSD: no vmx_machdata and no host TLB generation here. NetBSD's
- * pmap calls back into NVMM to bump a per-machine generation; FreeBSD's
- * EPT pmap keeps pm_eptgen itself, which vcpu_run will compare (phase 5).
+ * FreeBSD: no host TLB generation bumped by a pmap callback as in NetBSD.
+ * FreeBSD's EPT pmap counts its invalidations in pm_eptgen itself; each
+ * host CPU remembers the generation it last flushed this EPT at, as
+ * bhyve's vmx->eptgen[]. -1: never, so the first entry on a CPU always
+ * flushes (the EPT root page may have served another machine before).
  */
+struct vmx_machdata {
+	long eptgen[MAXCPU];
+};
 struct vmx_cpudata {
 	/* General */
 	uint64_t asid;
@@ -773,6 +825,10 @@ struct vmx_cpudata {
 	paddr_t msrbm_pa;
 
 	/* Host state */
+	uint64_t hdr[4];	/* FreeBSD: host DR0-DR3, DR6, DR7 and */
+	uint64_t hdr6;		/* DEBUGCTL, saved around the guest as */
+	uint64_t hdr7;		/* bhyve does (NetBSD has its own */
+	uint64_t hdebugctl;	/* per-lwp save of debug registers) */
 	uint64_t hxcr0;
 	uint64_t star;
 	uint64_t lstar;
@@ -1402,6 +1458,200 @@ out:
 	return ret;
 }
 
+/* -------------------------------------------------------------------------- */
+
+static void
+vmx_inject_ud(struct nvmm_cpu *vcpu)
+{
+	struct nvmm_comm_page *comm = vcpu->comm;
+	int ret __unused;
+
+	comm->event.type = NVMM_VCPU_EVENT_EXCP;
+	comm->event.vector = 6;
+	comm->event.u.excp.error = 0;
+
+	ret = vmx_vcpu_inject(vcpu);
+	OS_ASSERT(ret == 0);
+}
+
+static void
+vmx_inject_gp(struct nvmm_cpu *vcpu)
+{
+	struct nvmm_comm_page *comm = vcpu->comm;
+	int ret __unused;
+
+	comm->event.type = NVMM_VCPU_EVENT_EXCP;
+	comm->event.vector = 13;
+	comm->event.u.excp.error = 0;
+
+	ret = vmx_vcpu_inject(vcpu);
+	OS_ASSERT(ret == 0);
+}
+
+static inline int
+vmx_vcpu_event_commit(struct nvmm_cpu *vcpu)
+{
+	if (__predict_true(!vcpu->comm->event_commit)) {
+		return 0;
+	}
+	vcpu->comm->event_commit = false;
+	return vmx_vcpu_inject(vcpu);
+}
+
+static inline void
+vmx_inkernel_advance(void)
+{
+	uint64_t rip, inslen, intstate, rflags;
+
+	/*
+	 * Maybe we should also apply single-stepping and debug exceptions.
+	 * Matters for guest-ring3, because it can execute 'cpuid' under a
+	 * debugger.
+	 */
+
+	inslen = vmx_vmread(VMCS_EXIT_INSTRUCTION_LENGTH);
+	rip = vmx_vmread(VMCS_GUEST_RIP);
+	vmx_vmwrite(VMCS_GUEST_RIP, rip + inslen);
+
+	rflags = vmx_vmread(VMCS_GUEST_RFLAGS);
+	vmx_vmwrite(VMCS_GUEST_RFLAGS, rflags & ~PSL_RF);
+
+	intstate = vmx_vmread(VMCS_GUEST_INTERRUPTIBILITY);
+	vmx_vmwrite(VMCS_GUEST_INTERRUPTIBILITY,
+	    intstate & ~(INT_STATE_STI|INT_STATE_MOVSS));
+}
+
+static void
+vmx_exit_invalid(struct nvmm_vcpu_exit *exit, uint64_t code)
+{
+	exit->u.inv.hwcode = code;
+	exit->reason = NVMM_VCPU_EXIT_INVALID;
+}
+
+/*
+ * NMI that arrived while the guest ran. NetBSD calls its NMI handlers on
+ * a fake trapframe; FreeBSD, as bhyve, raises it again on the host with
+ * "int $2" while interrupts are still disabled, which runs the normal
+ * NMI path (watchdog, DTrace, debugger).
+ */
+static void
+vmx_exit_exc_nmi(struct nvmm_machine *mach __unused,
+    struct nvmm_cpu *vcpu __unused, struct nvmm_vcpu_exit *exit)
+{
+	uint64_t qual;
+
+	qual = vmx_vmread(VMCS_EXIT_INTR_INFO);
+
+	if ((qual & INTR_INFO_VALID) == 0) {
+		goto error;
+	}
+	if (__SHIFTOUT(qual, INTR_INFO_TYPE) != INTR_TYPE_NMI) {
+		goto error;
+	}
+
+	__asm volatile("int $2");
+
+	exit->reason = NVMM_VCPU_EXIT_NONE;
+	return;
+
+error:
+	vmx_exit_invalid(exit, VMCS_EXITCODE_EXC_NMI);
+}
+
+static void
+vmx_exit_insn(struct nvmm_vcpu_exit *exit, uint64_t reason)
+{
+	uint64_t inslen, rip;
+
+	inslen = vmx_vmread(VMCS_EXIT_INSTRUCTION_LENGTH);
+	rip = vmx_vmread(VMCS_GUEST_RIP);
+	exit->u.insn.npc = rip + inslen;
+	exit->reason = reason;
+}
+
+static void
+vmx_exit_hlt(struct nvmm_machine *mach __unused, struct nvmm_cpu *vcpu,
+    struct nvmm_vcpu_exit *exit)
+{
+	struct vmx_cpudata *cpudata = vcpu->cpudata;
+	uint64_t rflags;
+
+	if (cpudata->int_window_exit) {
+		rflags = vmx_vmread(VMCS_GUEST_RFLAGS);
+		if (rflags & PSL_I) {
+			vmx_event_waitexit_disable(vcpu, false);
+		}
+	}
+
+	vmx_inkernel_advance();
+	exit->reason = NVMM_VCPU_EXIT_HALTED;
+}
+
+#define VMX_QUAL_IO_SIZE	__BITS(2,0)
+#define		IO_SIZE_8	0
+#define		IO_SIZE_16	1
+#define		IO_SIZE_32	3
+#define VMX_QUAL_IO_IN		__BIT(3)
+#define VMX_QUAL_IO_STR		__BIT(4)
+#define VMX_QUAL_IO_REP		__BIT(5)
+#define VMX_QUAL_IO_DX		__BIT(6)
+#define VMX_QUAL_IO_PORT	__BITS(31,16)
+
+#define VMX_INFO_IO_ADRSIZE	__BITS(9,7)
+#define		IO_ADRSIZE_16	0
+#define		IO_ADRSIZE_32	1
+#define		IO_ADRSIZE_64	2
+#define VMX_INFO_IO_SEG		__BITS(17,15)
+
+static void
+vmx_exit_io(struct nvmm_machine *mach __unused, struct nvmm_cpu *vcpu,
+    struct nvmm_vcpu_exit *exit)
+{
+	uint64_t qual, info, inslen, rip;
+
+	qual = vmx_vmread(VMCS_EXIT_QUALIFICATION);
+	info = vmx_vmread(VMCS_EXIT_INSTRUCTION_INFO);
+
+	exit->reason = NVMM_VCPU_EXIT_IO;
+
+	exit->u.io.in = (qual & VMX_QUAL_IO_IN) != 0;
+	exit->u.io.port = __SHIFTOUT(qual, VMX_QUAL_IO_PORT);
+
+	OS_ASSERT(__SHIFTOUT(info, VMX_INFO_IO_SEG) < 6);
+	exit->u.io.seg = __SHIFTOUT(info, VMX_INFO_IO_SEG);
+
+	if (__SHIFTOUT(info, VMX_INFO_IO_ADRSIZE) == IO_ADRSIZE_64) {
+		exit->u.io.address_size = 8;
+	} else if (__SHIFTOUT(info, VMX_INFO_IO_ADRSIZE) == IO_ADRSIZE_32) {
+		exit->u.io.address_size = 4;
+	} else if (__SHIFTOUT(info, VMX_INFO_IO_ADRSIZE) == IO_ADRSIZE_16) {
+		exit->u.io.address_size = 2;
+	}
+
+	if (__SHIFTOUT(qual, VMX_QUAL_IO_SIZE) == IO_SIZE_32) {
+		exit->u.io.operand_size = 4;
+	} else if (__SHIFTOUT(qual, VMX_QUAL_IO_SIZE) == IO_SIZE_16) {
+		exit->u.io.operand_size = 2;
+	} else if (__SHIFTOUT(qual, VMX_QUAL_IO_SIZE) == IO_SIZE_8) {
+		exit->u.io.operand_size = 1;
+	}
+
+	exit->u.io.rep = (qual & VMX_QUAL_IO_REP) != 0;
+	exit->u.io.str = (qual & VMX_QUAL_IO_STR) != 0;
+
+	if (exit->u.io.in && exit->u.io.str) {
+		exit->u.io.seg = NVMM_X64_SEG_ES;
+	}
+
+	inslen = vmx_vmread(VMCS_EXIT_INSTRUCTION_LENGTH);
+	rip = vmx_vmread(VMCS_GUEST_RIP);
+	exit->u.io.npc = rip + inslen;
+
+	vmx_vcpu_state_provide(vcpu,
+	    NVMM_X64_STATE_GPRS | NVMM_X64_STATE_SEGS |
+	    NVMM_X64_STATE_CRS | NVMM_X64_STATE_MSRS);
+}
+
 
 /* -------------------------------------------------------------------------- */
 
@@ -1803,6 +2053,21 @@ vmx_vcpu_getstate(struct nvmm_cpu *vcpu)
 	comm->state_cached |= flags;
 }
 
+static void
+vmx_vcpu_state_provide(struct nvmm_cpu *vcpu, uint64_t flags)
+{
+	vcpu->comm->state_wanted = flags;
+	vmx_vcpu_getstate(vcpu);
+}
+
+static void
+vmx_vcpu_state_commit(struct nvmm_cpu *vcpu)
+{
+	vcpu->comm->state_wanted = vcpu->comm->state_commit;
+	vcpu->comm->state_commit = 0;
+	vmx_vcpu_setstate(vcpu);
+}
+
 /* -------------------------------------------------------------------------- */
 
 static void
@@ -1946,10 +2211,10 @@ vmx_vcpu_init(struct nvmm_machine *mach, struct nvmm_cpu *vcpu)
 	vmx_vmwrite(VMCS_CR4_SHADOW, 0);
 
 	/*
-	 * Set the Host state for resuming. FreeBSD: VMCS_HOST_RIP (the
-	 * resume label in the assembly file) and the per-CPU host fields
-	 * are written by vcpu_run (phase 5).
+	 * Set the Host state for resuming. The per-CPU host fields are
+	 * written by vcpu_run.
 	 */
+	vmx_vmwrite(VMCS_HOST_RIP, (uint64_t)vmx_resume_rip);
 	vmx_vmwrite(VMCS_HOST_CS_SELECTOR, GSEL(GCODE_SEL, SEL_KPL));
 	vmx_vmwrite(VMCS_HOST_SS_SELECTOR, GSEL(GDATA_SEL, SEL_KPL));
 	vmx_vmwrite(VMCS_HOST_DS_SELECTOR, GSEL(GDATA_SEL, SEL_KPL));
@@ -2260,21 +2525,26 @@ vmx_vcpu_resume(struct nvmm_machine *mach __unused, struct nvmm_cpu *vcpu)
 
 /* -------------------------------------------------------------------------- */
 
-/*
- * FreeBSD: the vmspace already has an EPT pmap (os_vmspace_ept_setup), and
- * its invalidations are tracked by the pmap itself (pm_eptgen). Nothing
- * per-machine is needed until vcpu_run.
- */
+/* FreeBSD: the vmspace already has an EPT pmap (os_vmspace_ept_setup). */
 static void
 vmx_machine_create(struct nvmm_machine *mach)
 {
+	struct vmx_machdata *machdata;
+	size_t i;
+
 	OS_ASSERT(vmspace_pmap(mach->vm)->pm_type == PT_EPT);
-	mach->machdata = NULL;
+
+	machdata = os_mem_zalloc(sizeof(struct vmx_machdata));
+	for (i = 0; i < MAXCPU; i++)
+		machdata->eptgen[i] = -1;
+	mach->machdata = machdata;
 }
 
 static void
-vmx_machine_destroy(struct nvmm_machine *mach __unused)
+vmx_machine_destroy(struct nvmm_machine *mach)
 {
+	os_mem_free(mach->machdata, sizeof(struct vmx_machdata));
+	mach->machdata = NULL;
 }
 
 static int
@@ -2616,12 +2886,517 @@ vmx_capability(struct nvmm_capability *cap)
 
 /* -------------------------------------------------------------------------- */
 
-/* Phase 5. The frontend answers ENOSYS before reaching it. */
-static int
-vmx_vcpu_run(struct nvmm_machine *mach __unused,
-    struct nvmm_cpu *vcpu __unused, struct nvmm_vcpu_exit *exit __unused)
+
+/* -------------------------------------------------------------------------- */
+
+/*
+ * FPU. NetBSD's fpu_area_restore/fpu_area_save, with FreeBSD's
+ * fpu_kern_enter(FPU_KERN_NOCTX) around them (decision P5-2): it saves the
+ * thread's FPU state if live, enters a critical section and lets us use
+ * the FPU registers; fpu_kern_leave() lets the thread reload its state
+ * lazily.
+ */
+static inline void
+vmx_fpu_restore(struct xsave_header *area, uint64_t mask, bool xsave)
 {
-	return ENOSYS;
+	if (xsave) {
+		__asm volatile("xrstor64 %0"
+		    : : "m" (*area), "a" ((uint32_t)mask),
+		    "d" ((uint32_t)(mask >> 32)) : "memory");
+	} else {
+		__asm volatile("fxrstor64 %0" : : "m" (*area) : "memory");
+	}
+}
+
+static inline void
+vmx_fpu_save(struct xsave_header *area, uint64_t mask, bool xsave)
+{
+	if (xsave) {
+		__asm volatile("xsave64 %0"
+		    : "=m" (*area) : "a" ((uint32_t)mask),
+		    "d" ((uint32_t)(mask >> 32)) : "memory");
+	} else {
+		__asm volatile("fxsave64 %0" : "=m" (*area) : : "memory");
+	}
+}
+
+static void
+vmx_vcpu_guest_fpu_enter(struct nvmm_cpu *vcpu)
+{
+	struct vmx_cpudata *cpudata = vcpu->cpudata;
+
+	/*
+	 * The guest's XCR0 had better not have any bits that aren't
+	 * allowed in the vCPU configuration, and the current XSAVE
+	 * area had better not store any either according to
+	 * cpudata->gfpu.xsh_xstate_bv.
+	 *
+	 * Note that XRSTOR will trap if XSTATE_BV has any bits that
+	 * are not set in XCR0.
+	 */
+	KASSERTMSG((cpudata->gxcr0 & ~cpudata->xcr0_mask) == 0,
+	    "gxcr0=0x%"PRIx64" xcr0_mask=0x%"PRIx64,
+	    cpudata->gxcr0, cpudata->xcr0_mask);
+	KASSERTMSG((cpudata->gfpu.xsh_xstate_bv & ~cpudata->xcr0_mask) == 0,
+	    "XSTATE_BV=0x%"PRIx64" xcr0_mask=0x%"PRIx64,
+	    cpudata->gfpu.xsh_xstate_bv, cpudata->xcr0_mask);
+
+	/*
+	 * Save anything in the FPU registers that this thread might
+	 * have been using to memory, and enter a critical section so
+	 * that nothing else uses the FPU on this CPU meanwhile.
+	 *
+	 * After this point, we are free to use the FPU registers.
+	 */
+	fpu_kern_enter(curthread, NULL, FPU_KERN_NOCTX);
+
+	/*
+	 * If the host CPU doesn't support XSAVE or we're simulating a
+	 * vCPU without it, just restore the x87 and SSE state.  The
+	 * host should already have both x87 and SSE enabled in XCR0,
+	 * if the host uses XSAVE.
+	 */
+	if (cpudata->xcr0_mask == 0) {
+		/* TODO: should we use *XSAVE64 here? */
+		vmx_fpu_restore(&cpudata->gfpu, XCR0_X87|XCR0_SSE, false);
+		return;
+	}
+
+	/*
+	 * Set XCR0 to allow access to anything the guest has
+	 * previously used and is saved to memory, _and_ to anything
+	 * the guest has asked to use in cpudata->gxcr0.
+	 *
+	 * The guest may have used some extended CPU state like the
+	 * zmmN registers, and then later disabled them in XCR0; in
+	 * that case, the state must be preserved in case the guest
+	 * later enables it in XCR0, but we can only load while all
+	 * bits in cpudata->gfpu.xsh_xstate_bv are set in XCR0.
+	 *
+	 * Similarly, the guest may _not_ have used some extended CPU
+	 * state since reset, but may have since enabled it in XCR0.
+	 * Such state will be clear in cpudata->gfpu.xsh_xstate_bv and
+	 * must be initialized afresh by the CPU, which requires the
+	 * bits be set in XCR0 to allow that.
+	 */
+	cpudata->hxcr0 = rxcr(0);
+	load_xcr(0, cpudata->xcr0_mask &
+	    (cpudata->gfpu.xsh_xstate_bv | cpudata->gxcr0));
+
+	/*
+	 * Load the guest's saved extended CPU state from memory into
+	 * the CPU.
+	 */
+	/* TODO: should we use *XSAVE64 here? */
+	vmx_fpu_restore(&cpudata->gfpu, cpudata->xcr0_mask, true);
+
+	/*
+	 * If we temporarily set XCR0 beyond what the guest asked for
+	 * in order to restore state that is currently disabled, reduce
+	 * it down to what the guest asked for.
+	 */
+	if (__predict_false(cpudata->gxcr0 != (cpudata->xcr0_mask &
+		    (cpudata->gfpu.xsh_xstate_bv | cpudata->gxcr0))))
+		load_xcr(0, cpudata->xcr0_mask & cpudata->gxcr0);
+}
+
+static void
+vmx_vcpu_guest_fpu_leave(struct nvmm_cpu *vcpu)
+{
+	struct vmx_cpudata *cpudata = vcpu->cpudata;
+
+	/*
+	 * If the host CPU doesn't support XSAVE or we're simulating a
+	 * vCPU without it, just save the x87 and SSE state.  If the
+	 * host uses XSAVE, it should still have both x87 and SSE
+	 * enabled in XCR0; if the host doesn't use XSAVE, doesn't
+	 * matter.
+	 */
+	if (cpudata->xcr0_mask == 0) {
+		/* TODO: should we use *XSAVE64 here? */
+		vmx_fpu_save(&cpudata->gfpu, XCR0_X87|XCR0_SSE, false);
+		goto leave;
+	}
+
+	/*
+	 * In case the guest has cleared some XCR0 bits but used the
+	 * corresponding extended CPU state, increase XCR0 to the
+	 * maximum supported for this guest before we XSAVE.
+	 *
+	 * Note that XRSTOR will trap if XSTATE_BV has any bits that
+	 * are not set in XCR0.
+	 */
+	cpudata->gxcr0 = rxcr(0);
+	load_xcr(0, cpudata->xcr0_mask);
+
+	/*
+	 * Paranoia: Ensure the guest's XCR0 has no forbidden bits.
+	 * Should not be possible because we filter them on XSETBV
+	 * exits.
+	 */
+	KASSERTMSG((cpudata->gxcr0 & ~cpudata->xcr0_mask) == 0,
+	    "gxcr0=0x%"PRIx64" xcr0_mask=0x%"PRIx64,
+	    cpudata->gxcr0, cpudata->xcr0_mask);
+	cpudata->gxcr0 &= cpudata->xcr0_mask;
+
+	/*
+	 * Save any extended CPU state that could be in use by the
+	 * guest.
+	 */
+	/* TODO: should we use *XSAVE64 here? */
+	vmx_fpu_save(&cpudata->gfpu, cpudata->xcr0_mask, false);
+
+	/*
+	 * If the host XCR0 is different from the maximum guest XCR0,
+	 * switch back to the host XCR0 so we can restore NetBSD's FPU
+	 * state.
+	 */
+	if (cpudata->xcr0_mask != cpudata->hxcr0)
+		load_xcr(0, cpudata->hxcr0);
+
+leave:	/*
+	 * Leave the FPU to this thread again: FreeBSD reloads its saved
+	 * state on its next FPU use.
+	 *
+	 * After this point, we must not touch the FPU registers.
+	 */
+	fpu_kern_leave(curthread, NULL);
+
+	/*
+	 * The guest's XCR0 had better not have any bits that aren't
+	 * allowed in the vCPU configuration, and the current XSAVE
+	 * area had better not store any either according to
+	 * cpudata->gfpu.xsh_xstate_bv.
+	 */
+	KASSERTMSG((cpudata->gxcr0 & ~cpudata->xcr0_mask) == 0,
+	    "gxcr0=0x%"PRIx64" xcr0_mask=0x%"PRIx64,
+	    cpudata->gxcr0, cpudata->xcr0_mask);
+	KASSERTMSG((cpudata->gfpu.xsh_xstate_bv & ~cpudata->xcr0_mask) == 0,
+	    "XSTATE_BV=0x%"PRIx64" xcr0_mask=0x%"PRIx64,
+	    cpudata->gfpu.xsh_xstate_bv, cpudata->xcr0_mask);
+}
+
+/*
+ * Debug registers. NetBSD saves the lwp's through x86_dbregs_save(); here,
+ * as bhyve's vmx_dr_enter_guest(), the host values are saved around the
+ * guest. A VM exit leaves DR7 = 0x400 and DEBUGCTL = 0, so both are
+ * restored too.
+ */
+static void
+vmx_vcpu_guest_dbregs_enter(struct nvmm_cpu *vcpu)
+{
+	struct vmx_cpudata *cpudata = vcpu->cpudata;
+
+	cpudata->hdr7 = rdr7();
+	cpudata->hdebugctl = rdmsr(MSR_DEBUGCTLMSR);
+
+	/* No host breakpoint may fire while guest values are loaded. */
+	load_dr7(0);
+
+	cpudata->hdr[0] = rdr0();
+	cpudata->hdr[1] = rdr1();
+	cpudata->hdr[2] = rdr2();
+	cpudata->hdr[3] = rdr3();
+	cpudata->hdr6 = rdr6();
+
+	load_dr0(cpudata->drs[NVMM_X64_DR_DR0]);
+	load_dr1(cpudata->drs[NVMM_X64_DR_DR1]);
+	load_dr2(cpudata->drs[NVMM_X64_DR_DR2]);
+	load_dr3(cpudata->drs[NVMM_X64_DR_DR3]);
+	load_dr6(cpudata->drs[NVMM_X64_DR_DR6]);
+}
+
+static void
+vmx_vcpu_guest_dbregs_leave(struct nvmm_cpu *vcpu)
+{
+	struct vmx_cpudata *cpudata = vcpu->cpudata;
+
+	cpudata->drs[NVMM_X64_DR_DR0] = rdr0();
+	cpudata->drs[NVMM_X64_DR_DR1] = rdr1();
+	cpudata->drs[NVMM_X64_DR_DR2] = rdr2();
+	cpudata->drs[NVMM_X64_DR_DR3] = rdr3();
+	cpudata->drs[NVMM_X64_DR_DR6] = rdr6();
+
+	load_dr0(cpudata->hdr[0]);
+	load_dr1(cpudata->hdr[1]);
+	load_dr2(cpudata->hdr[2]);
+	load_dr3(cpudata->hdr[3]);
+	load_dr6(cpudata->hdr6);
+	load_dr7(cpudata->hdr7);
+	wrmsr(MSR_DEBUGCTLMSR, cpudata->hdebugctl);
+}
+
+static void
+vmx_vcpu_guest_misc_enter(struct nvmm_cpu *vcpu)
+{
+	struct vmx_cpudata *cpudata = vcpu->cpudata;
+
+	/* This gets restored automatically by the CPU. */
+	vmx_vmwrite(VMCS_HOST_IDTR_BASE, (uint64_t)os_curcpu_idt());
+	vmx_vmwrite(VMCS_HOST_FS_BASE, rdmsr(MSR_FSBASE));
+	vmx_vmwrite(VMCS_HOST_CR3, rcr3());
+	vmx_vmwrite(VMCS_HOST_CR4, rcr4());
+
+	cpudata->kernelgsbase = rdmsr(MSR_KGSBASE);
+}
+
+static void
+vmx_vcpu_guest_misc_leave(struct nvmm_cpu *vcpu)
+{
+	struct vmx_cpudata *cpudata = vcpu->cpudata;
+
+	wrmsr(MSR_STAR, cpudata->star);
+	wrmsr(MSR_LSTAR, cpudata->lstar);
+	wrmsr(MSR_CSTAR, cpudata->cstar);
+	wrmsr(MSR_SF_MASK, cpudata->sfmask);
+	wrmsr(MSR_KGSBASE, cpudata->kernelgsbase);
+}
+
+/* -------------------------------------------------------------------------- */
+
+static inline void
+vmx_gtlb_catchup(struct nvmm_cpu *vcpu, int hcpu)
+{
+	struct vmx_cpudata *cpudata = vcpu->cpudata;
+
+	if (vcpu->hcpu_last != hcpu) {
+		cpudata->gtlb_want_flush = true;
+	}
+}
+
+/*
+ * EPT invalidations, FreeBSD's protocol (bhyve's vmx_pmap_activate): with
+ * interrupts off, mark this CPU active on the pmap, enter its SMR section,
+ * then compare the pmap's generation with the one this CPU last flushed
+ * at. pmap_invalidate_ept() bumps the generation, IPIs the CPUs in
+ * pm_active (a VM exit) and waits on the SMR for every CPU that may have
+ * read the old generation, so no guest runs on stale translations.
+ */
+static inline void
+vmx_pmap_activate(struct nvmm_machine *mach, pmap_t pmap, int hcpu)
+{
+	struct vmx_machdata *machdata = mach->machdata;
+	struct ept_desc ept_desc;
+	long eptgen;
+
+	CPU_SET_ATOMIC(hcpu, &pmap->pm_active);
+	smr_enter(pmap->pm_eptsmr);
+	eptgen = atomic_load_long(&pmap->pm_eptgen);
+	if (eptgen != machdata->eptgen[hcpu]) {
+		machdata->eptgen[hcpu] = eptgen;
+		ept_desc.eptp = vmx_vmread(VMCS_EPTP);
+		ept_desc.mbz = 0;
+		vmx_invept(vmx_ept_flush_op, &ept_desc);
+	}
+}
+
+static inline void
+vmx_pmap_deactivate(pmap_t pmap, int hcpu)
+{
+	smr_exit(pmap->pm_eptsmr);
+	CPU_CLR_ATOMIC(hcpu, &pmap->pm_active);
+}
+
+static inline void
+vmx_exit_evt(struct vmx_cpudata *cpudata)
+{
+	uint64_t info, err, inslen;
+
+	cpudata->evt_pending = false;
+
+	info = vmx_vmread(VMCS_IDT_VECTORING_INFO);
+	if (__predict_true((info & INTR_INFO_VALID) == 0)) {
+		return;
+	}
+	err = vmx_vmread(VMCS_IDT_VECTORING_ERROR);
+
+	vmx_vmwrite(VMCS_ENTRY_INTR_INFO, info);
+	vmx_vmwrite(VMCS_ENTRY_EXCEPTION_ERROR, err);
+
+	switch (__SHIFTOUT(info, INTR_INFO_TYPE)) {
+	case INTR_TYPE_SW_INT:
+	case INTR_TYPE_PRIV_SW_EXC:
+	case INTR_TYPE_SW_EXC:
+		inslen = vmx_vmread(VMCS_EXIT_INSTRUCTION_LENGTH);
+		vmx_vmwrite(VMCS_ENTRY_INSTRUCTION_LENGTH, inslen);
+	}
+
+	cpudata->evt_pending = true;
+}
+
+static int
+vmx_vcpu_run(struct nvmm_machine *mach, struct nvmm_cpu *vcpu,
+    struct nvmm_vcpu_exit *exit)
+{
+	struct nvmm_comm_page *comm = vcpu->comm;
+	struct vmx_cpudata *cpudata = vcpu->cpudata;
+	pmap_t pmap = vmspace_pmap(mach->vm);
+	struct region_descriptor gdtr, idtr;
+	struct vpid_desc vpid_desc;
+	uint64_t exitcode = 0;
+	uint64_t intstate;
+	int hcpu, ret;
+	bool launched;
+
+	vmx_vmcs_enter(vcpu);
+
+	vmx_vcpu_state_commit(vcpu);
+	comm->state_cached = 0;
+
+	if (__predict_false(vmx_vcpu_event_commit(vcpu) != 0)) {
+		vmx_vmcs_leave(vcpu);
+		return EINVAL;
+	}
+
+	hcpu = curcpu;
+	launched = cpudata->vmcs_launched;
+
+	vmx_gtlb_catchup(vcpu, hcpu);
+
+	if (vcpu->hcpu_last != hcpu) {
+		vmx_vmwrite(VMCS_HOST_TR_SELECTOR, os_curcpu_tss_sel());
+		vmx_vmwrite(VMCS_HOST_TR_BASE, (uint64_t)os_curcpu_tss());
+		vmx_vmwrite(VMCS_HOST_GDTR_BASE, (uint64_t)os_curcpu_gdt());
+		vmx_vmwrite(VMCS_HOST_GS_BASE, rdmsr(MSR_GSBASE));
+		cpudata->gtsc_want_update = true;
+		vcpu->hcpu_last = hcpu;
+	}
+
+	vmx_vcpu_guest_dbregs_enter(vcpu);
+	vmx_vcpu_guest_misc_enter(vcpu);
+
+	while (1) {
+		if (cpudata->gtlb_want_flush) {
+			vpid_desc.vpid = cpudata->asid;
+			vpid_desc.addr = 0;
+			vmx_invvpid(vmx_tlb_flush_op, &vpid_desc);
+			cpudata->gtlb_want_flush = false;
+		}
+
+		if (__predict_false(cpudata->gtsc_want_update)) {
+			vmx_vmwrite(VMCS_TSC_OFFSET, cpudata->gtsc - rdtsc());
+			cpudata->gtsc_want_update = false;
+		}
+
+		vmx_vcpu_guest_fpu_enter(vcpu);
+		vmx_cli();
+		/*
+		 * FreeBSD, as bhyve: a VM exit sets the GDTR and IDTR
+		 * limits to 0xFFFF (only the bases are in the VMCS); keep
+		 * the real ones to put back. The LDT is saved by the
+		 * assembly entry code.
+		 */
+		sgdt(&gdtr);
+		sidt(&idtr);
+		vmx_pmap_activate(mach, pmap, hcpu);
+		lcr2(cpudata->gcr2);
+		if (launched) {
+			ret = vmx_vmresume(cpudata->gprs);
+		} else {
+			ret = vmx_vmlaunch(cpudata->gprs);
+		}
+		cpudata->gcr2 = rcr2();
+		vmx_pmap_deactivate(pmap, hcpu);
+		bare_lgdt(&gdtr);
+		lidt(&idtr);
+		if (__predict_true(ret == 0)) {
+			exitcode = vmx_vmread(VMCS_EXIT_REASON);
+			exitcode &= __BITS(15,0);
+			if (exitcode == VMCS_EXITCODE_EXC_NMI) {
+				/* handle nmi before vmx_sti() */
+				vmx_exit_exc_nmi(mach, vcpu, exit);
+			}
+		}
+		vmx_sti();
+		vmx_vcpu_guest_fpu_leave(vcpu);
+
+		if (__predict_false(ret != 0)) {
+			vmx_exit_invalid(exit, -1);
+			break;
+		}
+		vmx_exit_evt(cpudata);
+
+		launched = true;
+
+		/*
+		 * Phase 5a: the exits below are handled; CPUID, CR, MSRs,
+		 * XSETBV, MONITOR/MWAIT (5c) and EPT violations (5b)
+		 * still come back to userland as invalid exits.
+		 */
+		switch (exitcode) {
+		case VMCS_EXITCODE_EXC_NMI:
+			/* handled earlier */
+			break;
+		case VMCS_EXITCODE_EXT_INT:
+			exit->reason = NVMM_VCPU_EXIT_NONE;
+			break;
+		case VMCS_EXITCODE_HLT:
+			vmx_exit_hlt(mach, vcpu, exit);
+			break;
+		case VMCS_EXITCODE_IO:
+			vmx_exit_io(mach, vcpu, exit);
+			break;
+		case VMCS_EXITCODE_SHUTDOWN:
+			exit->reason = NVMM_VCPU_EXIT_SHUTDOWN;
+			break;
+		case VMCS_EXITCODE_RDPMC:
+		case VMCS_EXITCODE_RDTSCP:
+		case VMCS_EXITCODE_INVVPID:
+		case VMCS_EXITCODE_INVEPT:
+		case VMCS_EXITCODE_VMCALL:
+		case VMCS_EXITCODE_VMCLEAR:
+		case VMCS_EXITCODE_VMLAUNCH:
+		case VMCS_EXITCODE_VMPTRLD:
+		case VMCS_EXITCODE_VMPTRST:
+		case VMCS_EXITCODE_VMREAD:
+		case VMCS_EXITCODE_VMRESUME:
+		case VMCS_EXITCODE_VMWRITE:
+		case VMCS_EXITCODE_VMXOFF:
+		case VMCS_EXITCODE_VMXON:
+			vmx_inject_ud(vcpu);
+			exit->reason = NVMM_VCPU_EXIT_NONE;
+			break;
+		case VMCS_EXITCODE_INT_WINDOW:
+			vmx_event_waitexit_disable(vcpu, false);
+			exit->reason = NVMM_VCPU_EXIT_INT_READY;
+			break;
+		case VMCS_EXITCODE_NMI_WINDOW:
+			vmx_event_waitexit_disable(vcpu, true);
+			exit->reason = NVMM_VCPU_EXIT_NMI_READY;
+			break;
+		default:
+			vmx_exit_invalid(exit, exitcode);
+			break;
+		}
+
+		/* If no reason to return to userland, keep rolling. */
+		if (nvmm_return_needed(vcpu, exit)) {
+			break;
+		}
+		if (exit->reason != NVMM_VCPU_EXIT_NONE) {
+			break;
+		}
+	}
+
+	cpudata->vmcs_launched = launched;
+
+	cpudata->gtsc = vmx_vmread(VMCS_TSC_OFFSET) + rdtsc();
+
+	vmx_vcpu_guest_misc_leave(vcpu);
+	vmx_vcpu_guest_dbregs_leave(vcpu);
+
+	exit->exitstate.rflags = vmx_vmread(VMCS_GUEST_RFLAGS);
+	exit->exitstate.cr8 = cpudata->gcr8;
+	intstate = vmx_vmread(VMCS_GUEST_INTERRUPTIBILITY);
+	exit->exitstate.int_shadow =
+	    (intstate & (INT_STATE_STI|INT_STATE_MOVSS)) != 0;
+	exit->exitstate.int_window_exiting = cpudata->int_window_exit;
+	exit->exitstate.nmi_window_exiting = cpudata->nmi_window_exit;
+	exit->exitstate.evt_pending = cpudata->evt_pending;
+
+	vmx_vmcs_leave(vcpu);
+
+	return 0;
 }
 
 const struct nvmm_impl nvmm_x86_vmx = {

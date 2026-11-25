@@ -94,6 +94,13 @@ struct xsave_header {
 } __packed;
 _Static_assert(sizeof(struct xsave_header) == 512 + 64, "xsave_header");
 
+/* <x86/cpufunc.h>: FreeBSD reads CR2 (rcr2) but has no writer. */
+static inline void
+lcr2(u_long val)
+{
+	__asm volatile("movq %0,%%cr2" : : "r" (val));
+}
+
 #define x86_cpuid2(leaf, subleaf, descs)	\
 	cpuid_count((leaf), (subleaf), (u_int *)(descs))
 

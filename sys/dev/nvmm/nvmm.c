@@ -1190,15 +1190,6 @@ nvmm_comm_object(struct nvmm_owner *owner, uint64_t off, size_t size,
 	return 0;
 }
 
-/*
- * FreeBSD port, phase 4: machines, vCPUs and guest memory are wired up.
- * vcpu_run (phase 5) answers ENOSYS until it is ported.
- */
-static bool
-nvmm_ioctl_ported(unsigned long cmd)
-{
-	return cmd != NVMM_IOC_VCPU_RUN;
-}
 
 #ifdef NVMM_DEBUG
 /*
@@ -1233,9 +1224,6 @@ static int
 nvmm_ioctl_internal(struct nvmm_owner *owner, unsigned long cmd, void *data)
 {
 	OS_ASSERT(owner != NULL);
-
-	if (!nvmm_ioctl_ported(cmd))
-		return ENOSYS;
 
 	switch (cmd) {
 	case NVMM_IOC_CAPABILITY:
