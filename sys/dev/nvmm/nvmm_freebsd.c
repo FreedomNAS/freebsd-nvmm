@@ -45,6 +45,8 @@
 #include <sys/mman.h>
 #include <sys/module.h>
 #include <sys/proc.h>
+#include <sys/smp.h>
+#include <sys/sysctl.h>
 #include <sys/time.h>
 
 #include <vm/vm.h>
@@ -56,6 +58,10 @@
 #include <vm/vm_object.h>
 #include <vm/vm_page.h>
 
+#include <machine/md_var.h>
+#include <machine/smp.h>
+#include <x86/apicvar.h>
+
 #include <dev/nvmm/nvmm.h>
 #include <dev/nvmm/nvmm_os.h>
 #include <dev/nvmm/nvmm_internal.h>
@@ -64,6 +70,97 @@
 MALLOC_DEFINE(M_NVMM, "nvmm", "NVMM data");
 
 int (*os_vmspace_pinit)(pmap_t) = NULL;
+
+/* -------------------------------------------------------------------------- */
+
+/*
+ * Read-only counters (decision P3-2 in PORTING.md): after a test, with no
+ * machine left, all of them must be back to 0.
+ */
+static volatile u_long nvmm_stat_kpages;
+static volatile u_long nvmm_stat_vmobjs;
+
+static SYSCTL_NODE(_hw, OID_AUTO, nvmm, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
+    "NVMM hypervisor");
+SYSCTL_ULONG(_hw_nvmm, OID_AUTO, kpages, CTLFLAG_RD,
+    __DEVOLATILE(u_long *, &nvmm_stat_kpages), 0,
+    "Kernel pages allocated by nvmm (VMCS, bitmaps, VMXON regions)");
+SYSCTL_ULONG(_hw_nvmm, OID_AUTO, vmobjs, CTLFLAG_RD,
+    __DEVOLATILE(u_long *, &nvmm_stat_vmobjs), 0,
+    "VM object references held by nvmm (comm pages, guest memory)");
+
+static int
+nvmm_sysctl_count(SYSCTL_HANDLER_ARGS)
+{
+	u_int nmach, nvcpu, val;
+
+	nvmm_count(&nmach, &nvcpu);
+	val = (arg2 == 0) ? nmach : nvcpu;
+	return sysctl_handle_int(oidp, &val, 0, req);
+}
+SYSCTL_PROC(_hw_nvmm, OID_AUTO, machines,
+    CTLTYPE_UINT | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0,
+    nvmm_sysctl_count, "IU", "Machines that exist");
+SYSCTL_PROC(_hw_nvmm, OID_AUTO, vcpus,
+    CTLTYPE_UINT | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 1,
+    nvmm_sysctl_count, "IU", "Virtual CPUs that exist");
+
+#define NVMM_KPAGES_ADD(n)	atomic_add_long(&nvmm_stat_kpages, (n))
+#define NVMM_KPAGES_SUB(n)	atomic_subtract_long(&nvmm_stat_kpages, (n))
+#define NVMM_VMOBJS_ADD()	atomic_add_long(&nvmm_stat_vmobjs, 1)
+#define NVMM_VMOBJS_SUB()	atomic_subtract_long(&nvmm_stat_vmobjs, 1)
+
+/* -------------------------------------------------------------------------- */
+
+/*
+ * Guest physical address spaces are vmspaces with an EPT pmap, as in bhyve
+ * (ept_pinit). The pmap sends the IPI vector stored in its flags to the
+ * CPUs running a guest of that pmap whenever it invalidates a mapping, so
+ * the vector is allocated before any machine exists; when no vector is
+ * free, IPI_AST does the same job at the cost of an AST check, as in bhyve.
+ */
+static int nvmm_ipinum = -1;
+static int nvmm_ept_pmap_flags;
+
+static int
+nvmm_ept_pinit(pmap_t pmap)
+{
+	return pmap_pinit_type(pmap, PT_EPT, nvmm_ept_pmap_flags);
+}
+
+void
+os_vmspace_ept_setup(bool has_ad)
+{
+	OS_ASSERT(nvmm_ipinum > 0);
+	nvmm_ept_pmap_flags = nvmm_ipinum & PMAP_NESTED_IPIMASK;
+	if (!has_ad)
+		nvmm_ept_pmap_flags |= PMAP_EMULATE_AD_BITS;
+	os_vmspace_pinit = nvmm_ept_pinit;
+}
+
+int
+os_ipi_vector(void)
+{
+	return nvmm_ipinum;
+}
+
+static void
+nvmm_ipi_alloc(void)
+{
+	nvmm_ipinum = lapic_ipi_alloc(pti ? &IDTVEC(justreturn1_pti) :
+	    &IDTVEC(justreturn));
+	if (nvmm_ipinum < 0)
+		nvmm_ipinum = IPI_AST;
+}
+
+static void
+nvmm_ipi_free(void)
+{
+	os_vmspace_pinit = NULL;
+	if (nvmm_ipinum > 0 && nvmm_ipinum != IPI_AST)
+		lapic_ipi_free(nvmm_ipinum);
+	nvmm_ipinum = -1;
+}
 
 /* -------------------------------------------------------------------------- */
 
@@ -108,18 +205,21 @@ os_vmspace_fault(os_vmspace_t *vm, vaddr_t va, vm_prot_t prot)
 os_vmobj_t *
 os_vmobj_create(voff_t size)
 {
+	NVMM_VMOBJS_ADD();
 	return vm_object_allocate(OBJT_SWAP, atop(round_page(size)));
 }
 
 void
 os_vmobj_ref(os_vmobj_t *vmobj)
 {
+	NVMM_VMOBJS_ADD();
 	vm_object_reference(vmobj);
 }
 
 void
 os_vmobj_rel(os_vmobj_t *vmobj)
 {
+	NVMM_VMOBJS_SUB();
 	vm_object_deallocate(vmobj);
 }
 
@@ -208,6 +308,7 @@ os_vmobj_unmap(os_vmmap_t *map, vaddr_t start, vaddr_t end, bool wired)
 void *
 os_pagemem_zalloc(size_t size)
 {
+	NVMM_KPAGES_ADD(atop(round_page(size)));
 	return (void *)kmem_malloc(round_page(size), M_WAITOK | M_ZERO);
 }
 
@@ -215,6 +316,7 @@ void
 os_pagemem_free(void *ptr, size_t size)
 {
 	kmem_free(ptr, round_page(size));
+	NVMM_KPAGES_SUB(atop(round_page(size)));
 }
 
 paddr_t
@@ -224,6 +326,7 @@ os_pa_zalloc(void)
 
 	m = vm_page_alloc_noobj(VM_ALLOC_WIRED | VM_ALLOC_ZERO |
 	    VM_ALLOC_WAITOK);
+	NVMM_KPAGES_ADD(1);
 	return VM_PAGE_TO_PHYS(m);
 }
 
@@ -235,6 +338,7 @@ os_pa_free(paddr_t pa)
 	m = PHYS_TO_VM_PAGE(pa);
 	vm_page_unwire_noq(m);
 	vm_page_free(m);
+	NVMM_KPAGES_SUB(1);
 }
 
 int
@@ -247,6 +351,7 @@ os_contigpa_zalloc(paddr_t *pa, vaddr_t *va, size_t npages)
 	if (addr == NULL)
 		return ENOMEM;
 
+	NVMM_KPAGES_ADD(npages);
 	*va = (vaddr_t)addr;
 	*pa = vtophys(addr);
 	return 0;
@@ -256,6 +361,7 @@ void
 os_contigpa_free(paddr_t pa __unused, vaddr_t va, size_t npages)
 {
 	kmem_free((void *)va, npages * PAGE_SIZE);
+	NVMM_KPAGES_SUB(npages);
 }
 
 time_t
@@ -439,9 +545,12 @@ nvmm_load(void)
 		return ENOTSUP;
 	}
 
+	nvmm_ipi_alloc();
 	error = nvmm_init();
-	if (error)
+	if (error) {
+		nvmm_ipi_free();
 		return error;
+	}
 
 	make_dev_args_init(&args);
 	args.mda_flags = MAKEDEV_CHECKNAME | MAKEDEV_WAITOK;
@@ -454,6 +563,7 @@ nvmm_load(void)
 		os_printf("nvmm: unable to create /dev/nvmm (error %d)\n",
 		    error);
 		nvmm_fini();
+		nvmm_ipi_free();
 		return error;
 	}
 
@@ -485,6 +595,7 @@ nvmm_unload(void)
 	}
 
 	nvmm_fini();
+	nvmm_ipi_free();
 	nvmm_loaded = false;
 	return 0;
 }

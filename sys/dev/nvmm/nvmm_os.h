@@ -447,6 +447,10 @@ time_t		os_time(void);
  * function; os_vmspace_create() fails while it is NULL.
  */
 extern int (*os_vmspace_pinit)(pmap_t);
+/* Installs the EPT pinit; has_ad = the CPU's EPT sets accessed/dirty bits. */
+void		os_vmspace_ept_setup(bool has_ad);
+/* IPI vector that interrupts a CPU running a guest (EPT pmap, kicks). */
+int		os_ipi_vector(void);
 #endif
 
 static inline bool

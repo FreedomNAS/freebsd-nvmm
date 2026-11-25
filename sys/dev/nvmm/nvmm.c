@@ -1125,6 +1125,27 @@ nvmm_fini(void)
 	nvmm_impl = NULL;
 }
 
+/*
+ * Lock-free snapshot for statistics: a machine or vCPU created or destroyed
+ * meanwhile may or may not be counted.
+ */
+void
+nvmm_count(unsigned int *nmach, unsigned int *nvcpu)
+{
+	size_t i, n;
+
+	*nmach = *nvcpu = 0;
+	for (i = 0; i < NVMM_MAX_MACHINES; i++) {
+		if (!os_atomic_load_bool(&machines[i].present))
+			continue;
+		(*nmach)++;
+		for (n = 0; n < NVMM_MAX_VCPUS; n++) {
+			if (os_atomic_load_bool(&machines[i].cpus[n].present))
+				(*nvcpu)++;
+		}
+	}
+}
+
 /* -------------------------------------------------------------------------- */
 
 /*

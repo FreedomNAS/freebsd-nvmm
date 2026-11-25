@@ -155,6 +155,8 @@ int nvmm_comm_object(struct nvmm_owner *, uint64_t, size_t, int,
     os_vmobj_t **, uint64_t *);
 void nvmm_suspend(void);
 void nvmm_resume(void);
+/* FreeBSD: machines and vCPUs that exist, for the hw.nvmm sysctls. */
+void nvmm_count(unsigned int *, unsigned int *);
 
 static inline bool
 nvmm_return_needed(struct nvmm_cpu *vcpu, struct nvmm_vcpu_exit *exit)
