@@ -192,13 +192,27 @@ os_vmspace_destroy(os_vmspace_t *vm)
 	vmspace_free(vm);
 }
 
+/*
+ * EPT violation on a guest physical address, as bhyve's vm_handle_paging():
+ * on a CPU whose EPT has no accessed/dirty bits the pmap emulates them by
+ * keeping the entry invalid until the first access, so a fault may only
+ * need the bits set; otherwise it is an ordinary fault on the vmspace.
+ */
 int
 os_vmspace_fault(os_vmspace_t *vm, vaddr_t va, vm_prot_t prot)
 {
+	vm_prot_t ftype;
 	int rv;
 
-	rv = vm_fault(&vm->vm_map, trunc_page(va), os_prot_to_vm(prot),
-	    VM_FAULT_NORMAL, NULL);
+	ftype = os_prot_to_vm(prot);
+	if (ftype == VM_PROT_READ || ftype == VM_PROT_WRITE) {
+		if (pmap_emulate_accessed_dirty(vmspace_pmap(vm), va,
+		    ftype) == 0)
+			return 0;
+	}
+
+	rv = vm_fault(&vm->vm_map, trunc_page(va), ftype, VM_FAULT_NORMAL,
+	    NULL);
 	return rv == KERN_SUCCESS ? 0 : EFAULT;
 }
 
