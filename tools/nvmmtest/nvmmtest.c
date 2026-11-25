@@ -1371,9 +1371,13 @@ static int
 run_with_host_vectors(int fd, struct nvmm_ioc_vcpu_run *args,
     const uint8_t in[32], uint8_t outx[16], uint8_t outy[32])
 {
-	long ret;
+	long ret, rdx = (long)args;
 	uint8_t cf;
 
+	/*
+	 * FreeBSD's syscall returns a second value in RDX and may change
+	 * RCX, R8-R11: the pointers must live in other registers.
+	 */
 	__asm volatile(
 	    "movdqu (%[in]), %%xmm0\n\t"
 	    "vmovdqu (%[in]), %%ymm1\n\t"
@@ -1382,11 +1386,12 @@ run_with_host_vectors(int fd, struct nvmm_ioc_vcpu_run *args,
 	    "movdqu %%xmm0, (%[ox])\n\t"
 	    "vmovdqu %%ymm1, (%[oy])\n\t"
 	    "vzeroupper\n\t"
-	    : "=a" (ret), [cf] "=r" (cf)
+	    : "=a" (ret), [cf] "=&b" (cf), "+d" (rdx)
 	    : "a" ((long)SYS_ioctl), "D" ((long)fd),
-	      "S" ((long)NVMM_IOC_VCPU_RUN), "d" (args),
+	      "S" ((long)NVMM_IOC_VCPU_RUN),
 	      [in] "r" (in), [ox] "r" (outx), [oy] "r" (outy)
-	    : "rcx", "r11", "xmm0", "xmm1", "memory", "cc");
+	    : "rcx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "memory",
+	      "cc");
 	return cf ? (int)ret : 0;
 }
 
@@ -1566,6 +1571,7 @@ main(int argc, char **argv)
 	int fd;
 
 	only_run = argc > 1 && strcmp(argv[1], "run") == 0;
+	setvbuf(stdout, NULL, _IOLBF, 0);
 
 	fd = open_nvmm();
 	{
