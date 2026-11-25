@@ -242,11 +242,6 @@ const struct nvmm_x64_state nvmm_x86_reset_state = {
 	}
 };
 
-/*
- * FreeBSD: the CPUID masks use NetBSD's CPUID feature names; they are
- * ported together with the CPUID exit handler that uses them (phase 5).
- */
-#if defined(__NetBSD__)
 const struct nvmm_x86_cpuid_mask nvmm_cpuid_00000001 = {
 	.eax = ~0,
 	.ebx = ~0,
@@ -470,8 +465,6 @@ const struct nvmm_x86_cpuid_mask nvmm_cpuid_80000008 = {
 	.ecx = ~0, /* TODO? */
 	.edx = 0
 };
-
-#endif /* __NetBSD__ */
 
 bool
 nvmm_x86_pat_validate(uint64_t val)
