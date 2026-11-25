@@ -538,3 +538,12 @@ Sulla macchina di test, micro-guest in real mode (`nvmmtest run`) e poi
 | 100000 uscite HLT fino a userland | ok, 3,35 µs l'una (ioctl, entry/exit, FPU) |
 | vCPU spostata su tutte e 4 le CPU (VMCLEAR remoto, campi host per CPU) | ok |
 | contatori e `kldunload` a fine prova | ok |
+
+### 5b: MMIO e protocollo EPT con la vCPU in esecuzione (2026-11-25)
+
+Nessun cambio nel kernel; prova `b90a290`. OK sulla macchina di test:
+
+| Prova | Risultato |
+|---|---|
+| scrittura a gpa non mappato 0x5000 → uscita MEMORY, `prot` WRITE, RIP sull'istruzione | ok |
+| guest che legge in un ciclo stretto gpa 0x3000 mentre un altro thread la rimappa 1000 volte su pagine con contenuti diversi | ok: ogni valore nuovo visto dal guest (circa 1 ms a giro, è il passo di attesa del test), nessuna traduzione EPT rimasta vecchia |
