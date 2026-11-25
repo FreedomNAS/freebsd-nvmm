@@ -27,12 +27,15 @@
  */
 
 /*
- * Phase 3 acceptance test, with raw ioctls (libnvmm is phase 6):
- * machines and vCPUs up to the limits, the reset state, a setstate/getstate
- * round trip, vCPU configuration, event injection, the requests that must
- * still answer ENOSYS, and a process that exits without destroying
- * anything. After each step the hw.nvmm counters must be back to where
- * they started.
+ * Acceptance test of phases 3 and 4, with raw ioctls (libnvmm is phase
+ * 6): machines and vCPUs up to the limits, the reset state, a
+ * setstate/getstate round trip, vCPU configuration, event injection, guest
+ * memory (host and guest mappings, their errors), vcpu_run still ENOSYS,
+ * and processes that exit without destroying anything. After each step the
+ * hw.nvmm counters must be back to where they started.
+ *
+ * With a module built with -DNVMM_DEBUG, the memory test also goes through
+ * the EPT: what the host writes the guest reads, and the other way round.
  */
 
 #include <sys/types.h>
@@ -53,6 +56,7 @@
 #include <unistd.h>
 
 #include <dev/nvmm/nvmm_ioctl.h>
+#include <dev/nvmm/nvmm_debug.h>
 
 #define CR0_NE		0x00000020
 #define CR4_PAE		0x00000020
@@ -68,6 +72,7 @@ struct counters {
 };
 
 static struct nvmm_capability cap;
+static bool have_debug;
 static struct counters base;
 static int nfail;
 
@@ -417,7 +422,7 @@ test_configure_inject(int fd)
 	uint64_t xcr0;
 	int error;
 
-	printf("configure, inject, requests still ENOSYS\n");
+	printf("configure, inject, vcpu_run still ENOSYS\n");
 	error = machine_create(fd, &machid);
 	check(error == 0, "machine: %s", strerror(error));
 	if (error)
@@ -473,23 +478,222 @@ test_configure_inject(int fd)
 	error = vcpu_ioctl(fd, NVMM_IOC_VCPU_RUN, machid, 0);
 	check(error == ENOSYS, "VCPU_RUN: expected ENOSYS, got %s",
 	    error ? strerror(error) : "success");
-	{
-		struct nvmm_ioc_gpa_map gm = { .machid = machid };
-		struct nvmm_ioc_hva_map hm = { .machid = machid };
-
-		error = ioctl(fd, NVMM_IOC_GPA_MAP, &gm) == -1 ? errno : 0;
-		check(error == ENOSYS, "GPA_MAP: expected ENOSYS, got %s",
-		    error ? strerror(error) : "success");
-		error = ioctl(fd, NVMM_IOC_HVA_MAP, &hm) == -1 ? errno : 0;
-		check(error == ENOSYS, "HVA_MAP: expected ENOSYS, got %s",
-		    error ? strerror(error) : "success");
-	}
 
 	munmap(comm, getpagesize());
 out:
 	error = machine_destroy(fd, machid);
 	check(error == 0, "destroy machine: %s", strerror(error));
 	check_counters("configure/inject");
+}
+
+/* -------------------------------------------------------------------------- */
+
+static int
+hva_map(int fd, nvmm_machid_t machid, void *hva, size_t size)
+{
+	struct nvmm_ioc_hva_map args = {
+		.machid = machid, .hva = (uintptr_t)hva, .size = size
+	};
+
+	return ioctl(fd, NVMM_IOC_HVA_MAP, &args) == -1 ? errno : 0;
+}
+
+static int
+hva_unmap(int fd, nvmm_machid_t machid, void *hva, size_t size)
+{
+	struct nvmm_ioc_hva_unmap args = {
+		.machid = machid, .hva = (uintptr_t)hva, .size = size
+	};
+
+	return ioctl(fd, NVMM_IOC_HVA_UNMAP, &args) == -1 ? errno : 0;
+}
+
+static int
+gpa_map(int fd, nvmm_machid_t machid, void *hva, gpaddr_t gpa, size_t size,
+    int prot)
+{
+	struct nvmm_ioc_gpa_map args = {
+		.machid = machid, .hva = (uintptr_t)hva, .gpa = gpa,
+		.size = size, .prot = prot
+	};
+
+	return ioctl(fd, NVMM_IOC_GPA_MAP, &args) == -1 ? errno : 0;
+}
+
+static int
+gpa_unmap(int fd, nvmm_machid_t machid, gpaddr_t gpa, size_t size)
+{
+	struct nvmm_ioc_gpa_unmap args = {
+		.machid = machid, .gpa = gpa, .size = size
+	};
+
+	return ioctl(fd, NVMM_IOC_GPA_UNMAP, &args) == -1 ? errno : 0;
+}
+
+static int
+debug_gpa(int fd, nvmm_machid_t machid, gpaddr_t gpa, int write, void *buf)
+{
+	struct nvmm_ioc_debug_gpa args = {
+		.machid = machid, .gpa = gpa, .write = write, .buf = buf
+	};
+
+	return ioctl(fd, NVMM_IOC_DEBUG_GPA, &args) == -1 ? errno : 0;
+}
+
+#define MEM_NPAGES	8
+#define GPA_RW		0x100000ULL
+#define GPA_RO		0x200000ULL
+#define GPA_NONE	0x300000ULL
+
+static void
+fill(void *buf, size_t len, uint8_t seed)
+{
+	uint8_t *p = buf;
+	size_t i;
+
+	for (i = 0; i < len; i++)
+		p[i] = (uint8_t)(seed + i * 7);
+}
+
+static void
+test_memory(int fd)
+{
+	size_t ps = (size_t)getpagesize(), size = MEM_NPAGES * ps;
+	nvmm_machid_t machid, machid2;
+	uint8_t *hva, *other, *buf, *want;
+	int error;
+
+	printf("memory: host and guest mappings%s\n", have_debug ?
+	    ", data through the EPT" : " (no debug module: no EPT data check)");
+	buf = malloc(ps);
+	want = malloc(ps);
+	if (buf == NULL || want == NULL)
+		err(1, "malloc");
+	error = machine_create(fd, &machid);
+	check(error == 0, "machine: %s", strerror(error));
+	if (error)
+		return;
+
+	hva = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE,
+	    -1, 0);
+	other = mmap(NULL, ps, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE,
+	    -1, 0);
+	if (hva == MAP_FAILED || other == MAP_FAILED)
+		err(1, "mmap");
+
+	/* Host mappings. */
+	error = hva_map(fd, machid, hva, size);
+	check(error == 0, "hva_map: %s", strerror(error));
+	error = hva_map(fd, machid, hva + 4 * ps, size);
+	check(error == EEXIST, "hva_map overlapping: expected EEXIST, got %s",
+	    error ? strerror(error) : "success");
+	error = hva_map(fd, machid, hva + 1, ps);
+	check(error == EINVAL, "hva_map unaligned: expected EINVAL, got %s",
+	    error ? strerror(error) : "success");
+
+	/* Guest mappings: one read-write, one read-only alias. */
+	error = gpa_map(fd, machid, hva, GPA_RW, size, PROT_READ | PROT_WRITE);
+	check(error == 0, "gpa_map rw: %s", strerror(error));
+	error = gpa_map(fd, machid, hva, GPA_RO, size, PROT_READ);
+	check(error == 0, "gpa_map ro: %s", strerror(error));
+	error = gpa_map(fd, machid, other, GPA_NONE, ps, PROT_READ);
+	check(error == EINVAL, "gpa_map of a non-hva_map'd address: expected "
+	    "EINVAL, got %s", error ? strerror(error) : "success");
+	error = gpa_map(fd, machid, hva, cap.max_ram, ps, PROT_READ);
+	check(error == EINVAL, "gpa_map beyond max_ram: expected EINVAL, "
+	    "got %s", error ? strerror(error) : "success");
+	error = gpa_map(fd, machid, hva, GPA_NONE + 1, ps, PROT_READ);
+	check(error == EINVAL, "gpa_map unaligned: expected EINVAL, got %s",
+	    error ? strerror(error) : "success");
+	error = gpa_map(fd, machid, hva, GPA_NONE, ps, 0x8);
+	check(error == EINVAL, "gpa_map bad prot: expected EINVAL, got %s",
+	    error ? strerror(error) : "success");
+
+	if (have_debug) {
+		/* Host writes, guest reads (both mappings). */
+		fill(hva + 2 * ps, ps, 0x11);
+		error = debug_gpa(fd, machid, GPA_RW + 2 * ps, 0, buf);
+		check(error == 0 && memcmp(buf, hva + 2 * ps, ps) == 0,
+		    "guest read of a host write (rw): %s",
+		    error ? strerror(error) : "data differs");
+		error = debug_gpa(fd, machid, GPA_RO + 2 * ps, 0, buf);
+		check(error == 0 && memcmp(buf, hva + 2 * ps, ps) == 0,
+		    "guest read of a host write (ro alias): %s",
+		    error ? strerror(error) : "data differs");
+
+		/* Guest writes, host reads. */
+		fill(want, ps, 0x5A);
+		error = debug_gpa(fd, machid, GPA_RW + 3 * ps, 1, want);
+		check(error == 0 && memcmp(hva + 3 * ps, want, ps) == 0,
+		    "host read of a guest write: %s",
+		    error ? strerror(error) : "data differs");
+
+		/* A page never touched by the host reads as zeros. */
+		memset(want, 0, ps);
+		error = debug_gpa(fd, machid, GPA_RW + 7 * ps, 0, buf);
+		check(error == 0 && memcmp(buf, want, ps) == 0,
+		    "untouched page: %s",
+		    error ? strerror(error) : "not zero");
+
+		/* Read-only alias and unmapped space must fault. */
+		error = debug_gpa(fd, machid, GPA_RO + 3 * ps, 1, want);
+		check(error == EFAULT, "guest write to read-only: expected "
+		    "EFAULT, got %s", error ? strerror(error) : "success");
+		error = debug_gpa(fd, machid, GPA_NONE, 0, buf);
+		check(error == EFAULT, "guest read of unmapped: expected "
+		    "EFAULT, got %s", error ? strerror(error) : "success");
+	}
+
+	/* Unmap the rw range: it faults, the alias still works. */
+	error = gpa_unmap(fd, machid, GPA_RW, size);
+	check(error == 0, "gpa_unmap: %s", strerror(error));
+	if (have_debug) {
+		error = debug_gpa(fd, machid, GPA_RW + 2 * ps, 0, buf);
+		check(error == EFAULT, "read after gpa_unmap: expected EFAULT, "
+		    "got %s", error ? strerror(error) : "success");
+		error = debug_gpa(fd, machid, GPA_RO + 3 * ps, 0, buf);
+		check(error == 0 && memcmp(buf, hva + 3 * ps, ps) == 0,
+		    "alias after unmapping the other range: %s",
+		    error ? strerror(error) : "data differs");
+	}
+	error = gpa_unmap(fd, machid, GPA_RO, size);
+	check(error == 0, "gpa_unmap alias: %s", strerror(error));
+	error = hva_unmap(fd, machid, hva, size);
+	check(error == 0, "hva_unmap: %s", strerror(error));
+	error = hva_unmap(fd, machid, hva, size);
+	check(error == ENOENT, "hva_unmap twice: expected ENOENT, got %s",
+	    error ? strerror(error) : "success");
+	error = machine_destroy(fd, machid);
+	check(error == 0, "destroy machine: %s", strerror(error));
+	check_counters("memory");
+
+	/* A machine destroyed with its memory still mapped. */
+	error = machine_create(fd, &machid2);
+	check(error == 0, "machine: %s", strerror(error));
+	if (error == 0) {
+		munmap(hva, size);
+		hva = mmap(NULL, size, PROT_READ | PROT_WRITE,
+		    MAP_ANON | MAP_PRIVATE, -1, 0);
+		if (hva == MAP_FAILED)
+			err(1, "mmap");
+		check(hva_map(fd, machid2, hva, size) == 0 &&
+		    gpa_map(fd, machid2, hva, GPA_RW, size,
+		    PROT_READ | PROT_WRITE) == 0, "maps for destroy test");
+		memset(hva, 0x77, size);
+		if (have_debug)
+			(void)debug_gpa(fd, machid2, GPA_RW, 0, buf);
+		error = machine_destroy(fd, machid2);
+		check(error == 0, "destroy with memory mapped: %s",
+		    strerror(error));
+		/* The host mapping stays usable until munmap. */
+		check(hva[size - 1] == 0x77, "host memory after destroy");
+		check_counters("destroy with memory mapped");
+	}
+
+	munmap(hva, size);
+	munmap(other, ps);
+	free(buf);
+	free(want);
 }
 
 /*
@@ -504,7 +708,7 @@ test_exit_without_destroy(void)
 	pid_t pid;
 	int status;
 
-	printf("exit without destroy: 4 machines x 4 vcpus in a child\n");
+	printf("exit without destroy: 4 machines x 4 vcpus + memory in a child\n");
 	fflush(stdout);	/* or the child prints the parent's buffer again */
 	pid = fork();
 	if (pid == -1)
@@ -522,6 +726,20 @@ test_exit_without_destroy(void)
 				if (vcpu_create(fd, machid, c) != 0)
 					_exit(3);
 				(void)comm_map(fd, machid, c);
+			}
+			/* And 16 pages of guest memory, touched. */
+			{
+				size_t sz = 16 * (size_t)getpagesize();
+				uint8_t *h = mmap(NULL, sz,
+				    PROT_READ | PROT_WRITE,
+				    MAP_ANON | MAP_PRIVATE, -1, 0);
+
+				if (h == MAP_FAILED ||
+				    hva_map(fd, machid, h, sz) != 0 ||
+				    gpa_map(fd, machid, h, 0, sz,
+				    PROT_READ | PROT_WRITE) != 0)
+					_exit(4);
+				memset(h, (int)m, sz);
 			}
 		}
 		get_counters(&mid);
@@ -543,6 +761,13 @@ main(void)
 	int fd;
 
 	fd = open_nvmm();
+	{
+		int dbg = 0;
+		size_t len = sizeof(dbg);
+
+		(void)sysctlbyname("hw.nvmm.debug", &dbg, &len, NULL, 0);
+		have_debug = dbg != 0;
+	}
 	get_counters(&base);
 	print_counters("at start:", &base);
 
@@ -550,6 +775,7 @@ main(void)
 	test_vcpus(fd);
 	test_state(fd);
 	test_configure_inject(fd);
+	test_memory(fd);
 	close(fd);
 	test_exit_without_destroy();
 
