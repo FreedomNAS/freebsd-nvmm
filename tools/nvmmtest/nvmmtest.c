@@ -46,6 +46,8 @@
 #include <sys/sysctl.h>
 #include <sys/wait.h>
 
+#include <machine/cpufunc.h>
+
 #include <err.h>
 #include <pthread.h>
 #include <signal.h>
@@ -403,6 +405,17 @@ test_state(int fd)
 	check(st->drs[NVMM_X64_DR_DR0] == 0x1000 &&
 	    st->drs[NVMM_X64_DR_DR7] == 0x401, "DRs differ");
 	for (i = 0; i < NVMM_X64_NMSR; i++) {
+		/*
+		 * The guest TSC keeps running from the value set: allow up
+		 * to ten seconds at 5 GHz.
+		 */
+		if (i == NVMM_X64_MSR_TSC) {
+			check(st->msrs[i] >= want.msrs[i] &&
+			    st->msrs[i] - want.msrs[i] < 50000000000ULL,
+			    "TSC 0x%jx, set to 0x%jx", (uintmax_t)st->msrs[i],
+			    (uintmax_t)want.msrs[i]);
+			continue;
+		}
 		check(st->msrs[i] == want.msrs[i], "MSR index %d: 0x%jx, want "
 		    "0x%jx", i, (uintmax_t)st->msrs[i],
 		    (uintmax_t)want.msrs[i]);
@@ -453,7 +466,12 @@ test_configure_inject(int fd)
 	memset(&tpr, 0, sizeof(tpr));
 	tpr.exit_changed = 1;
 	error = vcpu_configure(fd, machid, 0, NVMM_VCPU_CONF_TPR, &tpr);
-	check(error == 0, "conf tpr: %s", strerror(error));
+	/* SVM, as in NetBSD, has no TPR configuration. */
+	if (cap.arch.vcpu_conf_support & NVMM_CAP_ARCH_VCPU_CONF_TPR)
+		check(error == 0, "conf tpr: %s", strerror(error));
+	else
+		check(error == EINVAL, "conf tpr unsupported: expected "
+		    "EINVAL, got %s", error ? strerror(error) : "success");
 
 	xcr0 = cap.arch.xcr0_mask;
 	error = vcpu_configure(fd, machid, 0, NVMM_VCPU_CONF_XCR0_MASK,
@@ -1258,7 +1276,18 @@ test_run_cpuid_msr(int fd)
 	memcpy(id + 4, &gpr[NVMM_X64_GPR_RDX], 4);
 	memcpy(id + 8, &gpr[NVMM_X64_GPR_RCX], 4);
 	id[12] = '\0';
-	check(strcmp(id, "GenuineIntel") == 0, "cpuid 0 vendor \"%s\"", id);
+	{
+		u_int r[4];
+		char hid[13];
+
+		do_cpuid(0, r);
+		memcpy(hid, &r[1], 4);
+		memcpy(hid + 4, &r[3], 4);
+		memcpy(hid + 8, &r[2], 4);
+		hid[12] = '\0';
+		check(strcmp(id, hid) == 0, "cpuid 0 vendor \"%s\", host "
+		    "\"%s\"", id, hid);
+	}
 	check((uint32_t)gpr[NVMM_X64_GPR_RAX] <= 0x16,
 	    "cpuid 0 max leaf 0x%jx", (uintmax_t)gpr[NVMM_X64_GPR_RAX]);
 	printf("  vendor %s, max basic leaf 0x%jx\n", id,
@@ -1988,10 +2017,11 @@ int
 main(int argc, char **argv)
 {
 	struct counters end;
-	bool only_run;
+	bool only_run, only_base;
 	int fd;
 
 	only_run = argc > 1 && strcmp(argv[1], "run") == 0;
+	only_base = argc > 1 && strcmp(argv[1], "base") == 0;
 	if (argc > 1 && strcmp(argv[1], "avx") == 0) {
 		setvbuf(stdout, NULL, _IOLBF, 0);
 		fd = open_nvmm();
@@ -2021,12 +2051,14 @@ main(int argc, char **argv)
 		test_configure_inject(fd);
 		test_memory(fd);
 	}
-	test_run(fd);
-	test_run_ept(fd);
-	test_run_cpuid_msr(fd);
-	test_run_fpu(fd);
-	test_run_avx(fd);
-	test_run_signals(fd);
+	if (!only_base) {
+		test_run(fd);
+		test_run_ept(fd);
+		test_run_cpuid_msr(fd);
+		test_run_fpu(fd);
+		test_run_avx(fd);
+		test_run_signals(fd);
+	}
 	close(fd);
 	if (!only_run)
 		test_exit_without_destroy();

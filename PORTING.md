@@ -745,7 +745,12 @@ x86-svm`; `nvmmctl identify` dà 128 macchine, 256 vCPU, conf `CPUID`, FPU
 x87/SSE/AVX; `hw.nvmm.kpages` = 8 (le host save area); 100 cicli
 `kldload`/`kldunload` senza errori, `/dev/nvmm` sparisce allo scarico.
 Restano da provare per A1 i rifiuti (vmm.ko caricato, SVM spento dal BIOS)
-e S3.
+e S3. **A2 superata**: `nvmmtest base` (nuova modalità: macchine,
+vCPU, stato, configurazione, memoria, uscita senza destroy, niente guest
+eseguiti) OK; due prove corrette, valide anche per Intel: il TSC letto può
+essere più avanti di quello scritto (offset fisso, f56162b) e la
+configurazione TPR, che SVM non ha (come NetBSD), deve dare EINVAL quando
+la capability non la dichiara.
 
 ### 15.5 Rischi
 
