@@ -58,6 +58,25 @@ __KERNEL_RCSID(0, "$NetBSD: nvmm_x86.c,v 1.25 2026/07/15 01:22:21 riastradh Exp 
  * Code shared between x86-SVM and x86-VMX.
  */
 
+#if defined(__FreeBSD__)
+#include <sys/sysctl.h>
+
+/*
+ * Event-delivery counters (hw.nvmm.evt_*), to watch for lost interrupts:
+ * an injection that finds a previous event still waiting in the VMCS or
+ * VMCB replaces it, and that event is lost.
+ */
+SYSCTL_DECL(_hw_nvmm);
+u_long nvmm_x86_stat_evt_reinjected;
+u_long nvmm_x86_stat_evt_overwritten;
+SYSCTL_ULONG(_hw_nvmm, OID_AUTO, evt_reinjected, CTLFLAG_RD,
+    &nvmm_x86_stat_evt_reinjected, 0,
+    "Events re-injected after an exit during their delivery");
+SYSCTL_ULONG(_hw_nvmm, OID_AUTO, evt_overwritten, CTLFLAG_RD,
+    &nvmm_x86_stat_evt_overwritten, 0,
+    "Injections that replaced an event still pending in the VMCS/VMCB");
+#endif
+
 const struct nvmm_x64_state nvmm_x86_reset_state = {
 	.segs = {
 		[NVMM_X64_SEG_ES] = {

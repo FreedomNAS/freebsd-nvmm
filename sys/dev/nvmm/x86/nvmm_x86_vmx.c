@@ -1112,8 +1112,6 @@ vmx_ident(void)
 	int ret;
 
 	if (cpu_vendor_id != CPU_VENDOR_INTEL) {
-		os_printf("nvmm: not an Intel CPU; only the VMX backend is "
-		    "ported so far\n");
 		return false;
 	}
 	if (!(cpu_feature2 & CPUID2_VMX)) {
@@ -1411,21 +1409,6 @@ vmx_excp_has_error(uint8_t vector)
 	}
 }
 
-/*
- * Event-delivery counters (hw.nvmm.evt_*), to watch for lost interrupts:
- * an injection that finds a previous event still waiting in the VMCS
- * replaces it, and that event is lost.
- */
-SYSCTL_DECL(_hw_nvmm);
-static u_long vmx_stat_evt_reinjected;
-static u_long vmx_stat_evt_overwritten;
-SYSCTL_ULONG(_hw_nvmm, OID_AUTO, evt_reinjected, CTLFLAG_RD,
-    &vmx_stat_evt_reinjected, 0,
-    "Events re-injected after an exit during their delivery");
-SYSCTL_ULONG(_hw_nvmm, OID_AUTO, evt_overwritten, CTLFLAG_RD,
-    &vmx_stat_evt_overwritten, 0,
-    "Injections that replaced an event still pending in the VMCS");
-
 static int
 vmx_vcpu_inject(struct nvmm_cpu *vcpu)
 {
@@ -1444,7 +1427,7 @@ vmx_vcpu_inject(struct nvmm_cpu *vcpu)
 	vmx_vmcs_enter(vcpu);
 
 	if (vmx_vmread(VMCS_ENTRY_INTR_INFO) & INTR_INFO_VALID)
-		atomic_add_long(&vmx_stat_evt_overwritten, 1);
+		atomic_add_long(&nvmm_x86_stat_evt_overwritten, 1);
 
 	switch (evtype) {
 	case NVMM_VCPU_EVENT_EXCP:
@@ -4036,7 +4019,7 @@ vmx_exit_evt(struct vmx_cpudata *cpudata)
 
 	vmx_vmwrite(VMCS_ENTRY_INTR_INFO, info);
 	vmx_vmwrite(VMCS_ENTRY_EXCEPTION_ERROR, err);
-	atomic_add_long(&vmx_stat_evt_reinjected, 1);
+	atomic_add_long(&nvmm_x86_stat_evt_reinjected, 1);
 
 	switch (__SHIFTOUT(info, INTR_INFO_TYPE)) {
 	case INTR_TYPE_SW_INT:

@@ -382,6 +382,10 @@ bool nvmm_x86_pat_validate(uint64_t);
 uint32_t nvmm_x86_xsave_size(uint64_t);
 bool nvmm_x86_xcr0_valid(uint64_t, uint64_t);
 uint64_t nvmm_x86_munge_xcr0(uint64_t, uint64_t);
+#if defined(__FreeBSD__)
+extern u_long nvmm_x86_stat_evt_reinjected;
+extern u_long nvmm_x86_stat_evt_overwritten;
+#endif
 #endif
 
 #endif /* ASM_NVMM */
