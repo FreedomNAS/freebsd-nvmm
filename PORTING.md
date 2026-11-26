@@ -758,7 +758,10 @@ per ASID; CPUID AuthenticAMD foglia 0xd; FPU/TSC; YMM intatti dopo 1000
 uscite; segnali, stop, preemption, kill). La prima esecuzione aveva trovato
 un difetto della prova, non del backend: il guest può leggere 0x3000 tra
 `gpa_unmap` e `gpa_map`, e l'uscita MEMORY che ne viene è corretta; ora si
-rilancia e si conta ("while unmapped").
+rilancia e si conta ("while unmapped"). **A5 superata**: i programmi dei test ATF di NetBSD,
+lanciati a mano dalla cartella di compilazione, `h_io_assist` 12/12 e
+`h_mem_assist` 23/23 (64 e 16 bit; su AMD l'emulatore MMIO usa i byte
+dell'istruzione dati dalle decode assist). Restano A6 (QEMU) e A7.
 
 ### 15.5 Rischi
 
