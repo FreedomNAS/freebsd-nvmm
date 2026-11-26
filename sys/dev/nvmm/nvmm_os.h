@@ -449,6 +449,8 @@ time_t		os_time(void);
 extern int (*os_vmspace_pinit)(pmap_t);
 /* Installs the EPT pinit; has_ad = the CPU's EPT sets accessed/dirty bits. */
 void		os_vmspace_ept_setup(bool has_ad);
+/* Installs the AMD nested paging (NPT, PT_RVI) pinit. */
+void		os_vmspace_npt_setup(void);
 /* IPI vector that interrupts a CPU running a guest (EPT pmap, kicks). */
 int		os_ipi_vector(void);
 #ifdef NVMM_DEBUG

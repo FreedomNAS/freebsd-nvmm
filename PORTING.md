@@ -674,7 +674,7 @@ FreedomNAS.
 
 ---
 
-## 15. Porting AMD SVM: piano (2026-11-26, da approvare)
+## 15. Porting AMD SVM: piano (2026-11-26, decisioni S1 A, S2 A, S3 A)
 
 Il port copre solo Intel VMX: su un processore AMD `nvmm.ko` si rifiuta di
 caricarsi, quindi non è pronto per uscire. Questo è il piano per il backend
@@ -737,6 +737,15 @@ macchina di test (bridge `fnas_bridge1`).
 | A5 | libnvmm e test ATF di NetBSD | `kyua debug` come in fase 6 |
 | A6 | QEMU con i guest veri | Alpine e Devuan con UEFI dal modulo VM di FreedomNAS |
 | A7 | pacchetto: lo stesso `freedomnas-nvmm` con i due backend, tag v0.2.0, `distinfo` | installazione dal repo `dev` sull'ASUS e sull'i5 |
+
+**Avanzamento.** Il file `nvmm_x86_svm.c` è tradotto per intero (il modulo
+si compila solo completo), le prove seguono le fasi. 2026-11-26, ASUS
+M241DA, FreeBSD 15.1-p7: **A1 superata**. `nvmm: attached, using backend
+x86-svm`; `nvmmctl identify` dà 128 macchine, 256 vCPU, conf `CPUID`, FPU
+x87/SSE/AVX; `hw.nvmm.kpages` = 8 (le host save area); 100 cicli
+`kldload`/`kldunload` senza errori, `/dev/nvmm` sparisce allo scarico.
+Restano da provare per A1 i rifiuti (vmm.ko caricato, SVM spento dal BIOS)
+e S3.
 
 ### 15.5 Rischi
 

@@ -145,6 +145,27 @@ os_vmspace_ept_setup(bool has_ad)
 	os_vmspace_pinit = nvmm_ept_pinit;
 }
 
+/*
+ * AMD nested paging, as bhyve's svm_npt_init(): a PT_RVI pmap. The NPT
+ * entries always have accessed/dirty bits, so nothing is emulated; the
+ * pmap invalidates through the same pm_eptgen/SMR protocol as EPT.
+ */
+static int nvmm_npt_pmap_flags;
+
+static int
+nvmm_npt_pinit(pmap_t pmap)
+{
+	return pmap_pinit_type(pmap, PT_RVI, nvmm_npt_pmap_flags);
+}
+
+void
+os_vmspace_npt_setup(void)
+{
+	OS_ASSERT(nvmm_ipinum > 0);
+	nvmm_npt_pmap_flags = nvmm_ipinum & PMAP_NESTED_IPIMASK;
+	os_vmspace_pinit = nvmm_npt_pinit;
+}
+
 int
 os_ipi_vector(void)
 {

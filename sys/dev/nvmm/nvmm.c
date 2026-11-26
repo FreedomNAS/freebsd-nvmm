@@ -64,9 +64,7 @@ volatile bool nvmm_suspending;
 
 static const struct nvmm_impl *nvmm_impl_list[] = {
 #if defined(__x86_64__)
-#if !defined(__FreeBSD__)
 	&nvmm_x86_svm,	/* x86 AMD SVM */
-#endif
 	&nvmm_x86_vmx	/* x86 Intel VMX */
 #endif
 };
