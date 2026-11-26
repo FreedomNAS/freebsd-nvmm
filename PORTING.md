@@ -1,4 +1,4 @@
-# Porting di NVMM su FreeBSD 15.1 (amd64, Intel VMX)
+# Porting di NVMM su FreeBSD 15.1 (amd64, Intel VMX e AMD SVM)
 
 Stato: **analisi, fase 1**. Nessuna logica di virtualizzazione scritta.
 
@@ -671,3 +671,106 @@ Da fare: FreeBSD 15.1 come guest (l'immagine ufficiale non usa la seriale,
 serve un altro modo di verificare l'avvio), warp del TSC tra vCPU (~0,8 s,
 Linux lo tollera passando a HPET), port `emulators/qemu` per il repo
 FreedomNAS.
+
+---
+
+## 15. Porting AMD SVM: piano (2026-11-26, da approvare)
+
+Il port copre solo Intel VMX: su un processore AMD `nvmm.ko` si rifiuta di
+caricarsi, quindi non è pronto per uscire. Questo è il piano per il backend
+AMD, `nvmm_x86_svm.c`, sulla stessa strada di VMX (decisione **D1**: codice
+NetBSD, strato `os_*` di DragonFly).
+
+### 15.1 Cosa c'è già
+
+Tutto il codice comune è fatto e provato su Intel, e serve così com'è anche
+ad AMD: frontend `nvmm.c`, `nvmm_freebsd.c` (device, memoria guest, comm
+page, IPI, S3), `nvmm_x86.c` (CPUID, MSR, stato), libnvmm, nvmmctl, i test,
+le due patch di QEMU. Lo strato `os_*` ha già le allocazioni che servono a
+SVM: `os_pa_zalloc` (VMCB, una pagina), `os_contigpa_zalloc` (IOPM, 3 pagine
+contigue; MSRPM, 2 pagine contigue), `os_vmspace_pdirpa`. `nvmm.c` elenca già
+`nvmm_x86_svm` in `nvmm_impl_list`, oggi escluso con `#if !defined(__FreeBSD__)`.
+
+Il backend SVM di DragonFly usa lo stesso strato `os_*` (circa 45 chiamate
+diverse, tutte già implementate per VMX): resta il riferimento per la
+traduzione, come per VMX.
+
+### 15.2 Cosa cambia rispetto a VMX
+
+| | NetBSD | FreeBSD 15.1 |
+|---|---|---|
+| accendere SVM | `EFER.SVME` + `MSR_VM_HSAVE_PA` per CPU con `xc_broadcast` | uguale, con `smp_rendezvous` come per VMXON; host save area di una pagina per CPU (bhyve: `hsave[]`) |
+| rifiuto se c'è già un altro hypervisor | — | `EFER.SVME` già acceso su una CPU → rifiuto, come **F2-2** con `CR4.VMXE`. Il caso inverso (vmm.ko dopo nvmm.ko) è già coperto da **D3** |
+| SVM spento dal BIOS | `MSR_VM_CR.SVMDIS` → rifiuto | uguale (`MSR_VM_CR`, `VM_CR_SVMDIS` in `specialreg.h`) |
+| spazio guest | `pmap_npt_transform` (pmap patchato) | `pmap_pinit_type(pmap, PT_RVI, flags)`, come `svm_npt_init` di bhyve. I bit A/D esistono sempre nelle tabelle NPT: niente `PMAP_EMULATE_AD_BITS` |
+| invalidazione TLB guest | `mach_htlb_gen` + `gtlb_want_flush` | per FreeBSD `PT_RVI` è un pmap guest come `PT_EPT` (`pmap_type_guest`): stesso protocollo `pm_active` + SMR + `pm_eptgen` di `vmx_pmap_activate`. Quando la generazione vista da questa CPU è vecchia: `tlb_ctrl` = flush dell'ASID (o di tutto, senza FlushByAsid) invece di `INVEPT` |
+| ASID | bitmap globale, un ASID per vCPU, uno condiviso quando finiscono | vedi **S2** |
+| host state | `VMSAVE`/`VMLOAD` + MSR salvati a mano | uguale; PTI non c'è sugli AMD (FreeBSD lo accende solo dove serve) |
+
+### 15.3 Correzioni del port Intel da rifare in SVM
+
+Alcuni bug trovati su Intel erano nel file VMX e quindi vanno rifatti (o
+verificati) nel file SVM; gli altri erano in `nvmm_x86.c` e valgono già:
+
+| Commit | Bug | Dove |
+|---|---|---|
+| ce7bf09 | MXCSR di RESET a 0 | `nvmm_x86.c`: vale già |
+| 68921a2 | nomi delle feature CPUID | `nvmm_x86.c`: vale già |
+| 489d0a6 | FPU guest salvata con FXSAVE: metà alta degli YMM persa | VMX → **da rifare** (`fpu_area_save(…, bool)` di NetBSD vuol dire "formato 32 bit") |
+| e19a84f | `XSTATE_BV` stantio in setstate/getstate | VMX → **da rifare** |
+| f56162b, c3bd223 | offset TSC fisso, TSC iniziale alla creazione | VMX → **da rifare** con `vmcb->ctrl.tsc_offset` |
+| 0212170 | contatori `hw.nvmm.evt_*` | VMX → da aggiungere |
+
+### 15.4 Fasi
+
+Come per Intel: ogni fase si prova sull'hardware vero prima della successiva
+(niente VM annidate). Macchina AMD: l'all-in-one ASUS M241DA (Ryzen 7 3700U,
+Zen+, famiglia 17h) con FreeBSD 15.1, collegata alla porta `fnas_lan1` della
+macchina di test (bridge `fnas_bridge1`).
+
+| Fase | Contenuto | Prova |
+|---|---|---|
+| A1 | `svm_ident` (AMD, SVM, revisione 1, NP, NRIPS, `VM_CR.SVMDIS`), `svm_init`/`svm_fini`: EFER.SVME + HSAVE per CPU, rifiuto con EFER.SVME già acceso, S3 come **F2-3**, `nvmm_x86_svm` nella lista e nel Makefile | §8 come per Intel: carico/scarico 100 volte, rifiuti, `nvmmctl identify` |
+| A2 | macchine e vCPU: VMCB, IOPM, MSRPM, ASID (**S2**), `svm_vcpu_init`, setstate/getstate con le correzioni di 15.3 | `nvmmtest` (macchine, vCPU, stato) |
+| A3 | memoria guest su pmap `PT_RVI`, NPF exit → `vm_fault`, protocollo `pm_eptgen` con flush per ASID | `nvmmtest` memoria, `NVMM_IOC_DEBUG_GPA` |
+| A4 | `nvmm_x86_svmfunc.S`, ciclo `vcpu_run` (GIF, interrupt, NMI), uscite I/O, MMIO, HLT, CPUID, MSR, CR, XSETBV, FPU, debug register, TSC, segnali e `comm->stop` | i micro-guest di `nvmmtest` (5a–5e), `nvmmtest avx` |
+| A5 | libnvmm e test ATF di NetBSD | `kyua debug` come in fase 6 |
+| A6 | QEMU con i guest veri | Alpine e Devuan con UEFI dal modulo VM di FreedomNAS |
+| A7 | pacchetto: lo stesso `freedomnas-nvmm` con i due backend, tag v0.2.0, `distinfo` | installazione dal repo `dev` sull'ASUS e sull'i5 |
+
+### 15.5 Rischi
+
+1. **TLB guest stantii.** Se il flush per ASID manca dopo un cambio di
+   `pm_eptgen`, il guest legge pagine già restituite all'host: corruzione
+   della memoria dell'host. È lo stesso rischio di EPT; le prove di A3
+   (5b su Intel) lo coprono.
+2. **GIF e NMI.** Con GIF spento l'host non riceve interrupt né NMI: un
+   errore nell'ordine `clgi`/`stgi` blocca la CPU in modo silenzioso.
+3. **MSR host.** `VMSAVE`/`VMLOAD` coprono FS/GS/KernelGS, STAR/LSTAR/CSTAR/
+   SFMASK, TR, LDTR; `TSC_AUX`, `PAT` (il guest ha il suo `g_pat` con NPT) e
+   `SPEC_CTRL` vanno controllati uno per uno contro FreeBSD.
+4. **Divergenze NetBSD/DragonFly nel file SVM**, come al §2 punto 11: da
+   confrontare prima di A2.
+5. **Una sola macchina AMD.** Zen+ ha FlushByAsid e DecodeAssist: i percorsi
+   senza (CPU più vecchie) restano non provati; lo diremo nella
+   documentazione.
+
+### 15.6 Decisioni da prendere
+
+- **S1. Base del file.**
+  A) NetBSD `nvmm_x86_svm.c` tradotto con lo strato `os_*`, come VMX
+  (consigliato: stessa base e stesse correzioni dell'altro backend);
+  B) il file di DragonFly, già scritto con `os_*` (meno traduzione, ma base
+  diversa da VMX e meno aggiornato di NetBSD).
+- **S2. ASID.**
+  A) quelli di NetBSD: un ASID fisso per vCPU da una bitmap globale, uno
+  condiviso quando finiscono, più il controllo di `pm_eptgen` per CPU che
+  chiede il flush dell'ASID (consigliato: tocca meno codice NetBSD; Zen ha
+  32768 ASID);
+  B) quelli di bhyve: ASID per CPU con generazioni, riassegnati a ogni
+  cambio di CPU (niente limite, ma un'altra logica da scrivere e provare).
+- **S3. Ordine.**
+  A) fasi A1–A7 come sopra, una alla volta con prova sull'ASUS
+  (consigliato);
+  B) A1–A4 di seguito e prova solo con i micro-guest alla fine (più veloce,
+  ma un panic in A4 è più difficile da ricondurre alla causa).
