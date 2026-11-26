@@ -568,6 +568,46 @@ nvmm_x86_xsave_size(uint64_t xcr0)
 	return totalsize;
 }
 
+#if defined(__FreeBSD__)
+/*
+ * nvmm_x86_xsave_size_compacted(xcr0)
+ *
+ *	FreeBSD addition: the size of the compacted XSAVE area (XSAVEC)
+ *	for the state components in xcr0, the guest's
+ *	CPUID[EAX=0x0d,ECX=1].EBX with IA32_XSS = 0 (XSAVES is not given
+ *	to guests). The legacy area and header come first; each enabled
+ *	component i >= 2 follows, aligned on 64 bytes when
+ *	CPUID[EAX=0x0d,ECX=i].ECX bit 1 says so. NetBSD reports 0, and a
+ *	Linux guest that sees XSAVEC (Zen, Skylake and later) then finds
+ *	an inconsistent XSAVE layout, disables XSAVE and panics.
+ */
+uint32_t
+nvmm_x86_xsave_size_compacted(uint64_t xcr0)
+{
+	uint32_t totalsize = sizeof(struct xsave_header);
+	unsigned i;
+
+	KASSERTMSG((xcr0 & ~__BITS(62, 0)) == 0, "xcr0=0x%"PRIx64, xcr0);
+	KASSERTMSG((xcr0 & ~x86_xsave_features) == 0,
+	    "xcr0=0x%"PRIx64" x86_xsave_features=0x%"PRIx64,
+	    xcr0, x86_xsave_features);
+
+	for (i = 2; i < 63; i++) {
+		uint32_t descs[4];
+
+		if ((xcr0 & __BIT(i)) == 0)
+			continue;
+		x86_cpuid2(0x0d, i, descs);
+		if (descs[2] & __BIT(1))	/* 64-byte aligned */
+			totalsize = roundup(totalsize, 64);
+		OS_ASSERT(descs[0] <= UINT32_MAX - totalsize);
+		totalsize += descs[0];		/* size */
+	}
+
+	return totalsize;
+}
+#endif
+
 /*
  * nvmm_x86_xcr0_valid(xcr0, xcr0_mask)
  *

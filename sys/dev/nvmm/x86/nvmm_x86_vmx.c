@@ -1888,7 +1888,13 @@ vmx_inkernel_handle_cpuid(struct nvmm_machine *mach, struct nvmm_cpu *vcpu,
 			cpudata->gprs[NVMM_X64_GPR_RAX] &=
 			    (CPUID_PES1_XSAVEOPT | CPUID_PES1_XSAVEC |
 			     CPUID_PES1_XGETBV);
-			cpudata->gprs[NVMM_X64_GPR_RBX] = 0;
+			/*
+			 * FreeBSD: the compacted size for the guest's XCR0
+			 * (IA32_XSS is 0), not 0; see
+			 * nvmm_x86_xsave_size_compacted().
+			 */
+			cpudata->gprs[NVMM_X64_GPR_RBX] =
+			    nvmm_x86_xsave_size_compacted(cpudata->gxcr0);
 			cpudata->gprs[NVMM_X64_GPR_RCX] = 0;
 			cpudata->gprs[NVMM_X64_GPR_RDX] = 0;
 			break;
