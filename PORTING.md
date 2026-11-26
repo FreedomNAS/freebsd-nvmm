@@ -778,7 +778,11 @@ anche del backend Intel (da riverificare sull'i5):
   un offset base preso alla creazione, le vCPU partono da quello e una
   scrittura del valore di RESET le riporta lì (come `kvm_synchronize_tsc`).
 
-Resta A7 (pacchetto con i due backend).
+Poi **Devuan Excalibur 6.1.1** minimal-live (Linux 6.12, UEFI con il kernel
+della ISO passato a OVMF, 4 vCPU): `apt-get update`/`install gcc libc6-dev
+xz-utils`, AVX2 ×4, 3×200 MB xz con sha256 identici, clocksource `tsc`,
+nessun warp né oops. **A6 superata.** Resta A7 (pacchetto con i due
+backend), dopo la riprova di VMX sull'i5.
 
 ### 15.5 Rischi
 
