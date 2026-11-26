@@ -997,6 +997,7 @@ struct spin_ctx {
 	struct nvmm_comm_page *comm;
 	_Atomic int seen;	/* last value the guest reported, -1: none */
 	_Atomic int nexits;
+	_Atomic int nunmapped;	/* memory exits while 0x3000 was unmapped */
 	int error;
 	uint64_t bad_reason;
 };
@@ -1017,6 +1018,16 @@ spin_runner(void *arg)
 		atomic_fetch_add(&ctx->nexits, 1);
 		if (exit.reason == NVMM_VCPU_EXIT_NONE)
 			continue;
+		/*
+		 * The guest read 0x3000 between gpa_unmap and gpa_map: the
+		 * page was not there, a memory exit is right. Run the same
+		 * instruction again.
+		 */
+		if (exit.reason == NVMM_VCPU_EXIT_MEMORY &&
+		    exit.u.mem.gpa >= 0x3000 && exit.u.mem.gpa < 0x4000) {
+			atomic_fetch_add(&ctx->nunmapped, 1);
+			continue;
+		}
 		if (exit.reason != NVMM_VCPU_EXIT_IO || exit.u.io.port != 0x83) {
 			ctx->bad_reason = exit.reason;
 			break;
@@ -1159,8 +1170,9 @@ test_run_ept(int fd)
 	ms = ((t1.tv_sec - t0.tv_sec) * 1e9 + (t1.tv_nsec - t0.tv_nsec)) / 1e6;
 	if (i > REMAP_ROUNDS)
 		printf("  %d remaps seen by the running guest, %.3f ms each, "
-		    "%d exits\n", REMAP_ROUNDS, ms / REMAP_ROUNDS,
-		    atomic_load(&ctx.nexits));
+		    "%d exits (%d while unmapped)\n", REMAP_ROUNDS,
+		    ms / REMAP_ROUNDS, atomic_load(&ctx.nexits),
+		    atomic_load(&ctx.nunmapped));
 
 	munmap(comm, ps);
 out:

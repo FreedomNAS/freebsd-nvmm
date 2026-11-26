@@ -750,7 +750,15 @@ vCPU, stato, configurazione, memoria, uscita senza destroy, niente guest
 eseguiti) OK; due prove corrette, valide anche per Intel: il TSC letto può
 essere più avanti di quello scritto (offset fisso, f56162b) e la
 configurazione TPR, che SVM non ha (come NetBSD), deve dare EINVAL quando
-la capability non la dichiara.
+la capability non la dichiara. **A3 superata** col modulo `-DNVMM_DEBUG`: dati
+host↔guest attraverso il pmap `PT_RVI`. **A4 superata**: `nvmmtest run` OK
+tre volte di seguito (100000 uscite HLT a 3,11 µs, 8 CPU a turno; 1000
+rimappature viste dal guest in esecuzione, protocollo `pm_eptgen` con flush
+per ASID; CPUID AuthenticAMD foglia 0xd; FPU/TSC; YMM intatti dopo 1000
+uscite; segnali, stop, preemption, kill). La prima esecuzione aveva trovato
+un difetto della prova, non del backend: il guest può leggere 0x3000 tra
+`gpa_unmap` e `gpa_map`, e l'uscita MEMORY che ne viene è corretta; ora si
+rilancia e si conta ("while unmapped").
 
 ### 15.5 Rischi
 
