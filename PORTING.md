@@ -761,7 +761,24 @@ un difetto della prova, non del backend: il guest può leggere 0x3000 tra
 rilancia e si conta ("while unmapped"). **A5 superata**: i programmi dei test ATF di NetBSD,
 lanciati a mano dalla cartella di compilazione, `h_io_assist` 12/12 e
 `h_mem_assist` 23/23 (64 e 16 bit; su AMD l'emulatore MMIO usa i byte
-dell'istruzione dati dalle decode assist). Restano A6 (QEMU) e A7.
+dell'istruzione dati dalle decode assist). **A6 superata con Alpine**
+3.24.4 (QEMU 11.1.2 del repo FreedomNAS, UEFI, 4 vCPU, `-cpu host`): login
+in 11 s, rete, `apk update`/`apk add gcc musl-dev xz` e `apk audit`
+puliti, AVX2 in 4 processi paralleli, 3×200 MB xz con sha256 identici,
+clocksource `tsc`, nessun oops. Due difetti trovati e corretti, entrambi
+anche del backend Intel (da riverificare sull'i5):
+
+- CPUID 0xD.1 EBX = 0 con XSAVEC visibile (come NetBSD): Linux trova
+  un'area XSAVE incoerente, spegne XSAVE e va in panic in
+  `fpstate_reset`. Ora c'è la dimensione compatta per lo XCR0 del guest.
+  L'i5-4440 non ha XSAVEC, per questo su Intel non si vedeva.
+- TSC sfasato di ~8 s tra le vCPU: QEMU resetta le AP a INIT e scrive
+  TSC = 0; OVMF le aveva già fatte girare, quindi non era una riscrittura
+  del valore letto e il TSC delle AP ripartiva da 0. Ora ogni macchina ha
+  un offset base preso alla creazione, le vCPU partono da quello e una
+  scrittura del valore di RESET le riporta lì (come `kvm_synchronize_tsc`).
+
+Resta A7 (pacchetto con i due backend).
 
 ### 15.5 Rischi
 

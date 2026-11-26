@@ -581,6 +581,15 @@ static uint64_t svm_xcr0_mask __read_mostly;
 
 /* -------------------------------------------------------------------------- */
 
+/*
+ * FreeBSD: NetBSD's machdata held the host TLB generation, replaced by the
+ * pmap's pm_eptgen (struct svm_cpudata); what is left is the TSC.
+ */
+struct svm_machdata {
+	/* Guest TSC offset at which the TSC was 0 at creation. */
+	uint64_t tsc_base;
+};
+
 static const size_t svm_vcpu_conf_sizes[NVMM_X86_VCPU_NCONF] = {
 	[NVMM_VCPU_CONF_MD(NVMM_VCPU_CONF_CPUID)] =
 	    sizeof(struct nvmm_vcpu_conf_cpuid),
@@ -645,6 +654,7 @@ struct svm_cpudata {
 	 */
 	uint64_t gtsc_offset;
 	uint64_t gtsc_last;	/* last TSC getstate reported */
+	uint64_t gtsc_base;	/* the machine's offset (machdata) */
 
 	/* VCPU configuration. */
 	bool cpuidpresent[SVM_NCPUIDS];
@@ -2164,9 +2174,20 @@ svm_vcpu_setstate(struct nvmm_cpu *vcpu)
 		/*
 		 * FreeBSD: writing back the TSC getstate reported is not a
 		 * TSC write (QEMU does it with the rest of the MSRs): keep
-		 * the offset.
+		 * the offset. Writing the RESET value (QEMU resets a vCPU
+		 * at INIT, which real hardware does not do to the TSC) puts
+		 * the vCPU back on the machine's TSC, as KVM does: otherwise
+		 * the APs, which the firmware already ran, restarted their
+		 * TSC when Linux woke them up, seconds behind the BSP.
 		 */
-		if (state->msrs[NVMM_X64_MSR_TSC] != cpudata->gtsc_last) {
+		if (state->msrs[NVMM_X64_MSR_TSC] ==
+		    nvmm_x86_reset_state.msrs[NVMM_X64_MSR_TSC]) {
+			if (cpudata->gtsc_offset != cpudata->gtsc_base) {
+				cpudata->gtsc_offset = cpudata->gtsc_base;
+				cpudata->gtsc_want_update = true;
+			}
+		} else if (state->msrs[NVMM_X64_MSR_TSC] !=
+		    cpudata->gtsc_last) {
 			cpudata->gtsc_offset =
 			    state->msrs[NVMM_X64_MSR_TSC] - rdtsc();
 			cpudata->gtsc_want_update = true;
@@ -2561,12 +2582,11 @@ svm_vcpu_init(struct nvmm_machine *mach, struct nvmm_cpu *vcpu)
 	cpudata->eptgen = -1;
 
 	/*
-	 * FreeBSD, as in the VMX backend: the RESET TSC (0) starts now.
-	 * gtsc_last is the RESET value, so that QEMU writing it back at
-	 * reset keeps this offset on every vCPU.
+	 * FreeBSD: every vCPU starts on the machine's TSC, which was at its
+	 * RESET value (0) when the machine was created.
 	 */
-	cpudata->gtsc_offset = nvmm_x86_reset_state.msrs[NVMM_X64_MSR_TSC] -
-	    rdtsc();
+	cpudata->gtsc_base = ((struct svm_machdata *)mach->machdata)->tsc_base;
+	cpudata->gtsc_offset = cpudata->gtsc_base;
 	cpudata->gtsc_last = nvmm_x86_reset_state.msrs[NVMM_X64_MSR_TSC];
 	cpudata->gtsc_want_update = true;
 
@@ -2801,13 +2821,21 @@ svm_vcpu_configure(struct nvmm_cpu *vcpu, uint64_t op, void *data)
 static void
 svm_machine_create(struct nvmm_machine *mach)
 {
+	struct svm_machdata *machdata;
+
 	OS_ASSERT(vmspace_pmap(mach->vm)->pm_type == PT_RVI);
-	mach->machdata = NULL;
+
+	machdata = os_mem_zalloc(sizeof(struct svm_machdata));
+	machdata->tsc_base = nvmm_x86_reset_state.msrs[NVMM_X64_MSR_TSC] -
+	    rdtsc();
+	mach->machdata = machdata;
 }
 
 static void
-svm_machine_destroy(struct nvmm_machine *mach __unused)
+svm_machine_destroy(struct nvmm_machine *mach)
 {
+	os_mem_free(mach->machdata, sizeof(struct svm_machdata));
+	mach->machdata = NULL;
 }
 
 static int
